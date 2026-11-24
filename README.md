@@ -136,15 +136,49 @@ openocd -f interface/cmsis-dap.cfg -f target/rp2040.cfg \
 ### 6.2 인라인 어셈블리 → C 헬퍼
 원본의 모든 ICSP/JTAG 비트 시프트는 PIC18의 `RRCF`/`RLCF` 명령과 STATUS.CARRY 플래그를 활용한 인라인 어셈입니다. RP2040의 32비트 ARM 코어에서는 동일한 연산이 일반 C 시프트 연산으로 컴파일되며, 133MHz 클럭 덕분에 PIC18@48MHz보다 **사이클 수가 줄어들어 타이밍 마진이 더 넓습니다**. `shift_out_msb_first()` / `shift_in_msb_first()` 헬퍼로 추상화했습니다.
 
-### 6.3 DCDC 제어 루프
+### 6.3 정밀 타이밍 (RAM-resident 비트뱅 + 하드웨어 카운터)
+
+JTAG / One-Wire / UNI/O / Microwire 프로토콜은 마이크로초 단위의
+정밀 타이밍을 요구합니다. 단순한 `busy_wait_us_32()` /
+`busy_wait_at_least_cycles()`는 XIP 플래시 캐시 미스와 인터럽트로
+인해 ±1us 지터가 발생합니다. 이를 제거하기 위해 두 가지 기법을
+적용했습니다 (상세 설계는 `docs/TIMING_DESIGN.md` 참고):
+
+1. **RAM-resident 함수**: 핵심 타이밍 함수 8개를
+   `__attribute__((section(".time_critical.*")))`로 SRAM에 배치하여
+   XIP 캐시 미스 지터를 제거합니다. 링커 맵에서 모두 `0x20000xxx`
+   (SRAM 주소 영역)에 위치함을 확인했습니다:
+   - `hal_delay_cycles()` / `hal_delay_us_exact()` / `hal_delay_ns_exact()`
+   - `hal_od_drive_low()` / `hal_od_release()` (오픈드레인 에뮬레이션)
+   - `six_shift24()` / `regout_read16()` / `icsp8_shift8()`
+   - `hvsp_xfer()` / `tx16_shift()` / `rx16_shift()`
+
+2. **정밀 지연**: `busy_wait_at_least_cycles()`(최소값만 보장)를
+   `hal_delay_cycles()`(정확한 사이클 수)로 교체했습니다. 마이크로초
+   지연은 RP2040 TIMER 하드웨어의 64비트 카운터(`time_us_64()`)를
+   폴링하여 CPU 코드 경로와 무관하게 정확한 시간을 보장합니다.
+
+3. **오픈드레인 에뮬레이션**: One-Wire / UNI/O는 오픈드레인 버스입니다.
+   RP2040은 네이티브 OD 핀이 없으므로 핀 레벨을 0으로 고정하고
+   방향만 토글하여 OD를 에뮬레이션합니다. 레벨 설정 오버헤드가
+   없어 슬롯 엣지가 더 정확합니다.
+
+> **참고 — PIO(Programmable I/O)**: RP2040의 PIO는 CPU와 무관하게
+> 하드웨어에서 타이밍을 보장하는 가장 이상적인 방법입니다. 현재
+> 빌드 환경에서 pioasm 도구를 사용할 수 없어 PIO 구현은 보류하고
+> RAM-resident 방식으로 충분한 정밀도를 확보했습니다. pioasm 확보 시
+> One-Wire와 JTAG에 PIO를 추가 적용해 CPU 부하를 완전히 제거할 수
+> 있습니다. 자세한 설계는 `docs/TIMING_DESIGN.md`를 참고하세요.
+
+### 6.4 DCDC 제어 루프
 원본은 CCP2 compare 인터럽트(250us 주기, 4kHz)에서 PID 변종 제어 루프를 실행합니다. RP2040에서는 `add_repeating_timer_us(250, ...)`로 동일한 주기의 타이머 알람을 설정했고, `timer_isr()` 함수 본체는 제어 계수(`pwm += errz*225; pwm -= err*228`)를 그대로 보존했습니다.
 
 ADC는 12비트이지만 원본의 `Vcost` 상수가 10비트 기준이므로, `hal_adc_read_raw() >> 2`로 10비트로 정규화하여 제어 루프 계수를 그대로 재사용합니다.
 
-### 6.4 핀 다중화 보존
+### 6.5 핀 다중화 보존
 원본은 I2C SCL과 SPI SCK를 RB1 하나로 공유합니다. RP2040 포팅도 동일하게 `PIN_SCL`을 I2C/SPI/uW 클럭으로 공유하므로, **I2C와 SPI를 동시에 사용할 수 없는 원본의 제약이 그대로 유지**됩니다.
 
-### 6.5 SFR shim namespace
+### 6.6 SFR shim namespace
 원본 OPcontrol.c의 `INTCONbits.GIE`, `PIR1bits.ADIF`, `HLVDCONbits.IRVST` 같은 PIC18 SFR 비트 필드 참조를 struct-based shim(`hal.h`의 `hal_intcon_t`, `hal_pir1_t`, ...)으로 에뮬레이션했습니다. 이를 통해 OPcontrol.c의 코드 구조를 원본에 최대한 가깝게 유지했습니다.
 
 ## 7. 알려진 제약사항

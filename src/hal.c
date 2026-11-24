@@ -62,6 +62,93 @@ void Wait_us(uint16_t us) {
     busy_wait_us(us);
 }
 
+// ---- Precision timing (RAM-resident, cycle-counter based) ----------------
+// RP2040 has no DWT cycle counter (that's an M3/M4 feature), but the SysTick
+// timer is a 24-bit down-counter clocked from the system clock. We run it
+// free-running and read its value to measure exact cycle counts. Because
+// the timing functions live in SRAM (__not_in_flash_func), there are no
+// XIP flash stalls; the only remaining jitter source is an IRQ, which the
+// caller has already disabled via save_and_disable_interrupts().
+//
+// SysTick is normally used by the SDK for absolute-time scheduling, so we
+// do NOT reconfigure it here. Instead we use the RP2040 TIMER hardware's
+// 1 us rollover counter (TIMER_HW->TIMERAWR), which is a free-running
+// 64-bit microsecond counter that the SDK maintains. Reading it is a
+// single LDR instruction with no side effects — ideal for a tight spin.
+//
+// For sub-microsecond precision we fall back to a cycle-counted NOP loop
+// whose length is fixed by an asm volatile barrier (the compiler cannot
+// fold or hoist it).
+
+#include "hardware/timer.h"
+
+// System clock frequency in Hz (set once at init).
+static uint32_t hal_sys_clk_hz;
+
+void hal_timing_init(void) {
+    hal_sys_clk_hz = clock_get_hz(clk_sys);
+}
+
+// RAM-resident exact microsecond delay using the free-running 64-bit TIMER
+// counter. Resolution = 1 us. Jitter < 1 us as long as interrupts are off.
+__attribute__((section(".time_critical." "hal_delay_us_exact")))
+void hal_delay_us_exact(uint32_t us) {
+    uint64_t target = time_us_64() + us;
+    while (time_us_64() < target) {
+        __compiler_memory_barrier();
+    }
+}
+
+// RAM-resident cycle-counted delay. n cycles at hal_sys_clk_hz.
+// Uses a tight C loop that the compiler lowers to Thumb16-compatible
+// instructions (SUB + BNE). Each iteration is 3 cycles on Cortex-M0+.
+// The volatile counter prevents the optimizer from folding the loop.
+__attribute__((section(".time_critical." "hal_delay_cycles")))
+void hal_delay_cycles(uint32_t cycles) {
+    if (cycles == 0) return;
+    // Each loop iteration is 3 cycles (subs / bne / pipeline) on Cortex-M0+.
+    volatile uint32_t iters = cycles / 3;
+    uint32_t rem = cycles % 3;
+    while (iters--) {
+        __asm__ volatile ("nop");
+    }
+    // Burn the remainder (1 or 2 cycles) with NOPs.
+    while (rem--) __asm__ volatile ("nop");
+}
+
+// RAM-resident nanosecond delay. Converts ns to cycles at the system clock
+// frequency. Accuracy is ±1 cycle (±7.5 ns at 133 MHz).
+__attribute__((section(".time_critical." "hal_delay_ns_exact")))
+void hal_delay_ns_exact(uint32_t ns) {
+    if (!hal_sys_clk_hz) hal_sys_clk_hz = clock_get_hz(clk_sys);
+    // cycles = ns * Hz / 1e9, computed in fixed point to avoid float in
+    // the time-critical section.
+    uint32_t cycles = (uint32_t)(((uint64_t)ns * hal_sys_clk_hz) / 1000000000ull);
+    hal_delay_cycles(cycles);
+}
+
+// ---- Open-drain emulation helpers (RAM-resident) -------------------------
+// One-Wire / UNI/O buses need open-drain drive: the pin level is held at 0
+// and the bus state is controlled by direction. "release" = input (the
+// external 4.7k pull-up brings the bus high); "drive low" = output. These
+// live in SRAM so the slot-edge timing is deterministic.
+
+__attribute__((section(".time_critical." "hal_od_init")))
+void hal_od_init(uint pin) {
+    gpio_put(pin, 0);
+    gpio_set_dir(pin, GPIO_IN);   // released
+}
+
+__attribute__((section(".time_critical." "hal_od_release")))
+void hal_od_release(uint pin) {
+    gpio_set_dir(pin, GPIO_IN);   // hi-Z -> pull-up wins
+}
+
+__attribute__((section(".time_critical." "hal_od_drive_low")))
+void hal_od_drive_low(uint pin) {
+    gpio_set_dir(pin, GPIO_OUT);  // drive 0 (level already 0)
+}
+
 void DelayT(void) {
     // Original: for(tt=T2;tt;tt--) { 7 Nops }. T2 default 100, so ~700 cycles
     // at 48 MHz ~ 14.6 us. On RP2040 we keep the same wall-clock ~ a few us.

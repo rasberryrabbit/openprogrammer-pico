@@ -34,6 +34,10 @@ int main(void) {
     // the crystal. board_init() configures clocks and the USB peripheral.
     board_init();
     hal_init();
+    // Cache the system clock frequency for the RAM-resident precision
+    // delay primitives (hal_delay_us_exact / hal_delay_ns_exact). Must
+    // run AFTER board_init() so the clock is at its final 133 MHz.
+    hal_timing_init();
     usb_app_init();
     // BOARD_TUD_RHPORT is 0 on RP2040 (single USB port). Use the literal
     // since the BSP header is not included on the pico-sdk build.

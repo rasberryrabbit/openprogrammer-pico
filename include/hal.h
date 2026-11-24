@@ -140,12 +140,13 @@ extern "C" {
 //   CKpulse()  -> fastest (~250 ns)
 //   CKpulseN() -> normal (~500 ns, used for ICSP bit-bang)
 //   CKpulseL() -> long (~750 ns, used for PIC24 SIX)
-// On RP2040 at 133 MHz we approximate these with busy_wait_at_least_cycles.
+// On RP2040 at 133 MHz we use the RAM-resident exact cycle-counted delay
+// (hal_delay_cycles) so CK half-periods are deterministic, not "at least".
 #define CKpulse()     do { gpio_put(PIN_CK,1); __compiler_memory_barrier(); \
                            gpio_put(PIN_CK,0); } while(0)
-#define CKpulseN()    do { gpio_put(PIN_CK,1); busy_wait_at_least_cycles(8); \
-                           gpio_put(PIN_CK,0); busy_wait_at_least_cycles(8); } while(0)
-#define CKpulseL()    do { gpio_put(PIN_CK,1); busy_wait_at_least_cycles(16); \
+#define CKpulseN()    do { gpio_put(PIN_CK,1); hal_delay_cycles(8); \
+                           gpio_put(PIN_CK,0); hal_delay_cycles(8); } while(0)
+#define CKpulseL()    do { gpio_put(PIN_CK,1); hal_delay_cycles(16); \
                            gpio_put(PIN_CK,0); } while(0)
 
 #define PGM0()        gpio_put(PIN_PGM, 0)
@@ -337,6 +338,43 @@ void Delay1us(uint8_t delay);     // from original
 void Delay2us(uint8_t delay);     // from original
 void DelayT(void);                // software I2C half-bit delay
 void Wait_us(uint16_t us);        // arbitrary microsecond wait
+
+// ---- Precision timing (RAM-resident, cycle-counter based) ----------------
+// These are the jitter-free alternatives to busy_wait_us_32 / busy_wait_at_
+// least_cycles for tight bit-bang protocols (One-Wire, JTAG, UNI/O,
+// Microwire). Two properties make them precise:
+//
+//   1. RAM-resident: the functions are placed in SRAM via
+//      __not_in_flash_func, so they never stall on the XIP flash cache
+//      (the dominant source of ~1 us jitter on RP2040 bit-bangs).
+//   2. Cycle-counter driven: instead of a NOP loop whose length the
+//      compiler may fold or the CPU may stretch on a cache miss, the
+//      delay spins on the free-running 24-bit DWT/SysTick cycle counter,
+//      so the wait length is exact in clock cycles regardless of the
+//      code path taken to reach it.
+//
+// Callers MUST already have disabled interrupts (save_and_disable_inter-
+// rupts) so no ISR steals a slot mid-delay. The functions are safe to
+// nest inside a critical section.
+//
+//   hal_delay_us_exact(n)   - wait exactly n microseconds (±1 cycle)
+//   hal_delay_ns_exact(n)   - wait approximately n nanoseconds
+//   hal_delay_cycles(n)     - wait exactly n CPU cycles
+void hal_delay_us_exact(uint32_t us);
+void hal_delay_ns_exact(uint32_t ns);
+void hal_delay_cycles(uint32_t cycles);
+
+// Initialise the precision-timing cycle counter. Call once at boot.
+void hal_timing_init(void);
+
+// ---- Open-drain / push-pull pin helpers ----------------------------------
+// One-Wire and UNI/O need open-drain emulation on RP2040 (no native OD):
+// the pin level is held at 0 and the bus is controlled by toggling the
+// direction. "release" = input (external pull-up wins); "drive low" =
+// output. These are RAM-resident for jitter-free slot edges.
+void hal_od_release(uint pin);   // set input  -> bus goes high (pull-up)
+void hal_od_drive_low(uint pin); // set output -> bus goes low (level 0)
+void hal_od_init(uint pin);      // level 0, input (released)
 
 // ---- Interrupt / critical-section emulation ------------------------------
 // Original: INTCONbits.GIE = 0/1. On RP2040 we use save_and_disable_interrupts

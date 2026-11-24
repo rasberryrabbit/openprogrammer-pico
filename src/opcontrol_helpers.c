@@ -108,30 +108,35 @@ uint32_t jtag_xfer(uint32_t v, uint8_t nbits) {
 // The PIC24 ICSP protocol uses a longer clock period than PIC18. The
 // original CKpulseL() macro produces ~750 ns pulses; we approximate with
 // busy_wait_at_least_cycles(16). SIX shifts 24 bits MSB first; REGOUT reads
-// 16 bits MSB first.
+// 16 bits MSB first. These run inside a critical section and use the
+// RAM-resident exact cycle delay so the PIC24 long-clock half-period is
+// deterministic (the original PIC18 _asm block was cycle-calibrated too).
+__attribute__((section(".time_critical." "six_shift24")))
 void six_shift24(uint32_t v) {
     for (int8_t b = 23; b >= 0; b--) {
         gpio_put(PIN_D, (v >> b) & 1);
         gpio_put(PIN_CK, 1);
-        busy_wait_at_least_cycles(16);
+        hal_delay_cycles(16);
         gpio_put(PIN_CK, 0);
-        busy_wait_at_least_cycles(16);
+        hal_delay_cycles(16);
     }
 }
 
+__attribute__((section(".time_critical." "regout_read16")))
 uint16_t regout_read16(void) {
     uint16_t v = 0;
     for (uint8_t b = 0; b < 16; b++) {
         gpio_put(PIN_CK, 1);
-        busy_wait_at_least_cycles(16);
+        hal_delay_cycles(16);
         v = (v << 1) | (gpio_get(PIN_D) ? 1 : 0);
         gpio_put(PIN_CK, 0);
-        busy_wait_at_least_cycles(16);
+        hal_delay_cycles(16);
     }
     return v;
 }
 
 // ---- ICSP8 (8-bit PIC, e.g. PIC16F1xxx) ----------------------------------
+__attribute__((section(".time_critical." "icsp8_shift8")))
 void icsp8_shift8(uint8_t v) {
     // MSB first, normal CK pulse width. Matches the original ciclo_300.
     for (int8_t b = 7; b >= 0; b--) {
@@ -147,11 +152,14 @@ void icsp8_shift8(uint8_t v) {
 // Simultaneous 8-bit shift: drive SDI on PB1 and SII on PB0, read SDO on
 // PB2, clock on PB3. Matches the original ciclo_r200 block. The caller
 // pre-configures the four pins as outputs (PB1/PB0/PB3) and input (PB2).
+// RAM-resident + exact cycle delays so the SCK half-period matches the
+// AVR HVSP timing (~2 us min); the original PIC18 _asm was cycle-calibrated.
+__attribute__((section(".time_critical." "hvsp_xfer")))
 uint8_t hvsp_xfer(uint8_t sdi, uint8_t sii) {
     uint8_t sdo = 0;
     // Leading clock pulse (matches the original BSF/BCF PB3 before the loop).
     gpio_put(PB3, 1);
-    busy_wait_at_least_cycles(4);
+    hal_delay_cycles(4);
     gpio_put(PB3, 0);
     for (int8_t b = 7; b >= 0; b--) {
         // Read SDO bit (PB2) on the rising clock edge, before driving new data.
@@ -163,13 +171,13 @@ uint8_t hvsp_xfer(uint8_t sdi, uint8_t sii) {
         gpio_put(PB0, (sii >> b) & 1);
         // Clock pulse.
         gpio_put(PB3, 1);
-        busy_wait_at_least_cycles(4);
+        hal_delay_cycles(4);
         gpio_put(PB3, 0);
     }
     // Two trailing clock pulses (matches the original post-loop sequence).
-    gpio_put(PB3, 1); busy_wait_at_least_cycles(4); gpio_put(PB3, 0);
-    busy_wait_at_least_cycles(4);
-    gpio_put(PB3, 1); busy_wait_at_least_cycles(4); gpio_put(PB3, 0);
+    gpio_put(PB3, 1); hal_delay_cycles(4); gpio_put(PB3, 0);
+    hal_delay_cycles(4);
+    gpio_put(PB3, 1); hal_delay_cycles(4); gpio_put(PB3, 0);
     // Return D lines low.
     gpio_put(PB1, 0);
     gpio_put(PB0, 0);
@@ -181,27 +189,27 @@ uint8_t hvsp_xfer(uint8_t sdi, uint8_t sii) {
 // opcontrol.c inlines the microwire bit-bang directly (to match the
 // original byte-packing logic more closely). Mark them unused-aware so the
 // compiler does not warn.
-__attribute__((unused))
+__attribute__((unused, section(".time_critical." "uw_shift_out")))
 void uw_shift_out(uint32_t v, uint8_t nbits) {
     // MSB first. Matches the original uWTX _asm block: RLCF d, carry -> uWDO,
     // then CK pulse on uWCK.
     for (int8_t b = nbits - 1; b >= 0; b--) {
         gpio_put(PIN_SDO, (v >> b) & 1);   // uWDO = RC7
         gpio_put(PIN_SCL, 1);              // uWCK = RB1
-        busy_wait_at_least_cycles(8);
+        hal_delay_cycles(8);
         gpio_put(PIN_SCL, 0);
-        busy_wait_at_least_cycles(8);
+        hal_delay_cycles(8);
     }
 }
 
-__attribute__((unused))
+__attribute__((unused, section(".time_critical." "uw_shift_in")))
 uint32_t uw_shift_in(uint8_t nbits) {
     uint32_t v = 0;
     for (int8_t b = nbits - 1; b >= 0; b--) {
         gpio_put(PIN_SCL, 1);              // uWCK = RB1
-        busy_wait_at_least_cycles(8);
+        hal_delay_cycles(8);
         gpio_put(PIN_SCL, 0);
-        busy_wait_at_least_cycles(8);
+        hal_delay_cycles(8);
         v = (v << 1) | (gpio_get(PIN_SDA) ? 1 : 0);  // uWDI = RB0
     }
     return v;
@@ -209,25 +217,29 @@ uint32_t uw_shift_in(uint8_t nbits) {
 
 // ---- TX16 / RX16 (PIC24 long-clock 16-bit shifts) -----------------------
 // The original uses a T1-calibrated half-bit delay between CK rising and
-// falling edges. We approximate with busy_wait_us_32(T1).
+// falling edges. We use the RAM-resident exact microsecond delay so the
+// long-clock half-period is jitter-free (the original PIC18 T1-calibrated
+// NOP loop was exact too).
+__attribute__((section(".time_critical." "tx16_shift")))
 void tx16_shift(uint16_t v, uint8_t t1) {
     for (int8_t b = 15; b >= 0; b--) {
         gpio_put(PIN_D, (v >> b) & 1);
         gpio_put(PIN_CK, 1);
-        busy_wait_us_32(t1);
+        hal_delay_us_exact(t1);
         gpio_put(PIN_CK, 0);
-        busy_wait_us_32(t1);
+        hal_delay_us_exact(t1);
     }
 }
 
+__attribute__((section(".time_critical." "rx16_shift")))
 uint16_t rx16_shift(uint8_t t1) {
     uint16_t v = 0;
     for (uint8_t b = 0; b < 16; b++) {
         gpio_put(PIN_CK, 1);
-        busy_wait_us_32(t1);
+        hal_delay_us_exact(t1);
         v = (v << 1) | (gpio_get(PIN_D) ? 1 : 0);
         gpio_put(PIN_CK, 0);
-        busy_wait_us_32(t1);
+        hal_delay_us_exact(t1);
     }
     return v;
 }

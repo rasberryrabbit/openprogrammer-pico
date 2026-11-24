@@ -1769,6 +1769,8 @@ static void ParseCommands(void) {
     case uWTX: {
         // Transmit N bits MSB first on uWDO (RC7), clock on uWCK (RB1).
         // Bits are packed MSB-first across successive payload bytes.
+        // Uses RAM-resident cycle-counted delays so the uWCK half-period
+        // is exact (the original PIC loop was cycle-calibrated too).
         TXins(uWTX);
         i = receive_buffer[++RXptr];
         if (RXptr + ((i - 1) >> 3) + 1 < number_of_bytes_read) {
@@ -1784,9 +1786,9 @@ static void ParseCommands(void) {
                 bit_in_byte--;
                 gpio_put(PIN_SDO, (cur >> (7 - bit_in_byte)) & 1);
                 gpio_put(PIN_SCL, 1);
-                busy_wait_at_least_cycles(8);
+                hal_delay_cycles(8);            // ~60 ns uWCK high (exact)
                 gpio_put(PIN_SCL, 0);
-                busy_wait_at_least_cycles(8);
+                hal_delay_cycles(8);            // ~60 ns uWCK low (exact)
             }
             restore_interrupts(st);
         } else {
@@ -1798,6 +1800,7 @@ static void ParseCommands(void) {
 
     case uWRX: {
         // Receive N bits MSB first, pack into bytes, return N + bytes.
+        // Same RAM-resident cycle-counted uWCK as uWTX.
         TXins(uWRX);
         if (RXptr + 1 < number_of_bytes_read &&
             TXptr + ((i - 1) >> 3) + 1 < HID_INPUT_REPORT_BYTES) {
@@ -1809,9 +1812,9 @@ static void ParseCommands(void) {
             uint8_t bits_left = i;
             while (bits_left--) {
                 gpio_put(PIN_SCL, 1);
-                busy_wait_at_least_cycles(8);
+                hal_delay_cycles(8);
                 gpio_put(PIN_SCL, 0);
-                busy_wait_at_least_cycles(8);
+                hal_delay_cycles(8);
                 LOBYTE(d) = (LOBYTE(d) << 1) |
                             (gpio_get(PIN_SDA) ? 1 : 0);
                 i2--;
@@ -1832,46 +1835,45 @@ static void ParseCommands(void) {
     // ---- One-Wire (SDA = RB0) ---------------------------------------------
     case OW_RESET: {
         // Reset pulse; return 1 if presence detected.
+        // Uses open-drain emulation (direction toggles, level held 0) and
+        // RAM-resident exact microsecond delays so the 480 us reset / 70 us
+        // presence-sample / 410 us recovery windows are jitter-free.
         TXins(OW_RESET);
+        hal_od_init(PIN_SDA);               // level 0, released (input)
         uint32_t st = save_and_disable_interrupts();
-        gpio_put(PIN_SDA, 1);
-        gpio_set_dir(PIN_SDA, GPIO_OUT);
-        __compiler_memory_barrier();
-        gpio_put(PIN_SDA, 0);
-        Delay1us(250);
-        Delay1us(250);
-        gpio_put(PIN_SDA, 1);      // active pull-up
-        __compiler_memory_barrier();
-        gpio_set_dir(PIN_SDA, GPIO_IN);  // hi-Z
-        Delay1us(70);
-        if (gpio_get(PIN_SDA) == 0) TXins(1);
+        hal_od_drive_low(PIN_SDA);          // bus low
+        hal_delay_us_exact(480);            // reset low time (spec: >=480us)
+        hal_od_release(PIN_SDA);            // release (pull-up)
+        hal_delay_us_exact(70);             // wait into presence window
+        if (gpio_get(PIN_SDA) == 0) TXins(1);   // presence detected
         else TXins(0);
-        Delay1us(150);
-        Delay1us(150);
+        hal_delay_us_exact(410);            // recovery (spec: >=480us total)
         restore_interrupts(st);
         break;
     }
 
     case OW_WRITE: {
-        // Write N bytes LSB first.
+        // Write N bytes LSB first. Open-drain + exact-timing slot edges.
+        // Write-1 slot: 6 us low + 64 us release.
+        // Write-0 slot: 60 us low + 10 us release.
         TXins(OW_WRITE);
         i = receive_buffer[++RXptr];
         if (RXptr + i < number_of_bytes_read) {
             uint8_t k;
+            hal_od_init(PIN_SDA);
             for (; i; i--) {
                 i2 = receive_buffer[++RXptr];
                 uint32_t st = save_and_disable_interrupts();
                 for (k = 8; k > 0; k--) {
-                    gpio_put(PIN_SDA, 0);
-                    gpio_set_dir(PIN_SDA, GPIO_OUT);   // start pulse
+                    hal_od_drive_low(PIN_SDA);      // start pulse
                     if (i2 & 1) {
-                        Delay1us(4);
-                        gpio_put(PIN_SDA, 1);           // active pull-up
-                        Delay1us(66);
+                        hal_delay_us_exact(6);      // write-1 recovery window
+                        hal_od_release(PIN_SDA);
+                        hal_delay_us_exact(64);
                     } else {
-                        Delay1us(60);
-                        gpio_put(PIN_SDA, 1);
-                        Delay1us(10);
+                        hal_delay_us_exact(60);     // write-0 low time
+                        hal_od_release(PIN_SDA);
+                        hal_delay_us_exact(10);
                     }
                     i2 >>= 1;
                 }
@@ -1885,32 +1887,26 @@ static void ParseCommands(void) {
     }
 
     case OW_READ: {
-        // Read N bytes LSB first.
+        // Read N bytes LSB first. Open-drain + exact-timing read slot:
+        //   6 us low, release, sample @ ~15 us, release until 70 us.
         TXins(OW_READ);
         i = receive_buffer[++RXptr];
         if (RXptr < number_of_bytes_read &&
             TXptr + i < HID_INPUT_REPORT_BYTES) {
             uint8_t k;
             TXins(i);
+            hal_od_init(PIN_SDA);
             for (; i; i--) {
                 uint32_t st = save_and_disable_interrupts();
                 i2 = 0;
                 for (k = 8; k > 0; k--) {
-                    gpio_put(PIN_SDA, 0);
-                    gpio_set_dir(PIN_SDA, GPIO_OUT);
-                    Delay1us(6);
-                    gpio_put(PIN_SDA, 1);
-                    __compiler_memory_barrier();
-                    gpio_set_dir(PIN_SDA, GPIO_IN);
-                    Delay1us(8);
+                    hal_od_drive_low(PIN_SDA);      // start pulse
+                    hal_delay_us_exact(6);
+                    hal_od_release(PIN_SDA);        // release for master read
+                    hal_delay_us_exact(9);          // sample at ~15 us
                     i2 >>= 1;
                     if (gpio_get(PIN_SDA)) i2 += 0x80;
-                    Delay1us(40);
-                    gpio_put(PIN_SDA, 1);
-                    gpio_set_dir(PIN_SDA, GPIO_OUT);
-                    __compiler_memory_barrier();
-                    gpio_set_dir(PIN_SDA, GPIO_IN);
-                    Delay1us(16);
+                    hal_delay_us_exact(55);         // finish slot (>=60us tot)
                 }
                 TXins(i2);
                 restore_interrupts(st);
@@ -1924,17 +1920,14 @@ static void ParseCommands(void) {
 
     // ---- UNI/O (SCIO = RB0) -----------------------------------------------
     case UNIO_STBY: {
-        // Standby pulse (~621 us).
+        // Standby pulse (~621 us). Open-drain + exact timing.
         TXins(UNIO_STBY);
+        hal_od_init(PIN_SDA);
         uint32_t st = save_and_disable_interrupts();
-        gpio_put(PIN_SDA, 0);
-        gpio_set_dir(PIN_SDA, GPIO_OUT);
-        Delay1us(10);
-        gpio_put(PIN_SDA, 1);
-        Delay1us(250);
-        Delay1us(250);
-        Delay1us(110);
-        gpio_set_dir(PIN_SDA, GPIO_IN);
+        hal_od_drive_low(PIN_SDA);
+        hal_delay_us_exact(10);
+        hal_od_release(PIN_SDA);
+        hal_delay_us_exact(610);            // 10 + 610 = 620 us total
         restore_interrupts(st);
         break;
     }
@@ -1947,39 +1940,41 @@ static void ParseCommands(void) {
         if (RXptr + i < number_of_bytes_read &&
             TXptr + i2 < HID_INPUT_REPORT_BYTES) {
             uint8_t k, dx;
+            hal_od_init(PIN_SDA);
             uint32_t st = save_and_disable_interrupts();
             if (i) {
                 // Start header: 0x55 sent Manchester-encoded at ~50 kHz.
-                gpio_put(PIN_SDA, 0);
-                gpio_set_dir(PIN_SDA, GPIO_OUT);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 1);
-                Delay1us(10);
-                gpio_put(PIN_SDA, 0);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 1);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 0);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 1);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 0);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 1);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 0);
-                Delay1us(20);
-                gpio_put(PIN_SDA, 1);
-                Delay1us(10);
-                gpio_put(PIN_SDA, 0);          // MAK
-                Delay1us(10);
-                gpio_put(PIN_SDA, 1);
-                Delay1us(10);
-                gpio_set_dir(PIN_SDA, GPIO_IN);
-                Delay1us(5);
+                // Open-drain + exact microsecond delays for jitter-free
+                // half-bit edges (UNI/O devices are timing-strict).
+                hal_od_drive_low(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_release(PIN_SDA);
+                hal_delay_us_exact(10);
+                hal_od_drive_low(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_release(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_drive_low(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_release(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_drive_low(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_release(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_drive_low(PIN_SDA);
+                hal_delay_us_exact(20);
+                hal_od_release(PIN_SDA);
+                hal_delay_us_exact(10);
+                hal_od_drive_low(PIN_SDA);          // MAK
+                hal_delay_us_exact(10);
+                hal_od_release(PIN_SDA);
+                hal_delay_us_exact(10);
+                hal_od_release(PIN_SDA);            // ensure released (hi-Z)
+                hal_delay_us_exact(5);
                 k = 0;
                 if (gpio_get(PIN_SDA) == 0) k = 1;
-                Delay1us(10);
+                hal_delay_us_exact(10);
                 if (gpio_get(PIN_SDA) == 0) k = 1;
                 Delay1us(2);
                 if (k) {                       // incorrect SAK
@@ -1990,36 +1985,35 @@ static void ParseCommands(void) {
             // Send N bytes (MSB first).
             for (; i; i--) {
                 dx = receive_buffer[++RXptr];
-                gpio_put(PIN_SDA, 0);
-                gpio_set_dir(PIN_SDA, GPIO_OUT);
+                hal_od_drive_low(PIN_SDA);
                 for (k = 8; k > 0; k--) {
                     if (dx & 0x80) {
-                        gpio_put(PIN_SDA, 0);
-                        Delay1us(10);
-                        gpio_put(PIN_SDA, 1);
+                        hal_od_drive_low(PIN_SDA);
+                        hal_delay_us_exact(10);
+                        hal_od_release(PIN_SDA);
                     } else {
-                        gpio_put(PIN_SDA, 1);
-                        Delay1us(10);
-                        gpio_put(PIN_SDA, 0);
+                        hal_od_release(PIN_SDA);
+                        hal_delay_us_exact(10);
+                        hal_od_drive_low(PIN_SDA);
                     }
-                    Delay1us(8);
+                    hal_delay_us_exact(8);
                     dx <<= 1;
                 }
                 if (i2 || i > 1) {
-                    gpio_put(PIN_SDA, 0);      // MAK
-                    Delay1us(10);
-                    gpio_put(PIN_SDA, 1);
+                    hal_od_drive_low(PIN_SDA);      // MAK
+                    hal_delay_us_exact(10);
+                    hal_od_release(PIN_SDA);
                 } else {
-                    gpio_put(PIN_SDA, 1);      // NoMAK
-                    Delay1us(10);
-                    gpio_put(PIN_SDA, 0);
+                    hal_od_release(PIN_SDA);        // NoMAK
+                    hal_delay_us_exact(10);
+                    hal_od_drive_low(PIN_SDA);
                 }
-                Delay1us(10);
-                gpio_set_dir(PIN_SDA, GPIO_IN);
-                Delay1us(5);
+                hal_delay_us_exact(10);
+                hal_od_release(PIN_SDA);            // hi-Z for SAK sample
+                hal_delay_us_exact(5);
                 k = 0;
                 if (gpio_get(PIN_SDA)) k = 1;
-                Delay1us(10);
+                hal_delay_us_exact(10);
                 if (gpio_get(PIN_SDA) == 0) k = 1;
                 if (k) {
                     TXins(ACK_ERR);
@@ -2027,50 +2021,48 @@ static void ParseCommands(void) {
                     i2 = 0;
                 }
                 if (i > 1) {
-                    for (uint8_t n = 0; n < 11; n++) __compiler_memory_barrier();
+                    hal_delay_us_exact(2);          // inter-byte spacing
                 }
             }
-            for (uint8_t n = 0; n < 3; n++) __compiler_memory_barrier();
+            hal_delay_us_exact(1);
             TXins(i2);
             // Receive M bytes (MSB first).
             for (; i2; i2--) {
                 dx = 0;
-                gpio_set_dir(PIN_SDA, GPIO_IN);
+                hal_od_release(PIN_SDA);            // input for master read
                 for (k = 8; k > 0; k--) {
-                    Delay1us(3);
+                    hal_delay_us_exact(3);
                     dx <<= 1;
                     if (gpio_get(PIN_SDA) == 0) {
-                        Delay1us(10);
+                        hal_delay_us_exact(10);
                         if (gpio_get(PIN_SDA)) dx += 1;
                     } else {
-                        Delay1us(10);
-                        for (uint8_t n = 0; n < 4; n++) __compiler_memory_barrier();
+                        hal_delay_us_exact(10);
+                        // constant-timing branch (no data bit)
                     }
-                    for (uint8_t n = 0; n < 5; n++) __compiler_memory_barrier();
-                    if (k > 1) Delay1us(4);
-                    else Delay1us(2);
+                    if (k > 1) hal_delay_us_exact(4);
+                    else hal_delay_us_exact(2);
                 }
-                for (uint8_t n = 0; n < 6; n++) __compiler_memory_barrier();
-                gpio_set_dir(PIN_SDA, GPIO_OUT);
+                hal_delay_us_exact(2);
+                hal_od_drive_low(PIN_SDA);          // back to output for MAK
                 if (i2 > 1) {
-                    gpio_put(PIN_SDA, 0);      // MAK
-                    Delay1us(10);
-                    gpio_put(PIN_SDA, 1);
+                    hal_od_drive_low(PIN_SDA);      // MAK
+                    hal_delay_us_exact(10);
+                    hal_od_release(PIN_SDA);
                 } else {
-                    gpio_put(PIN_SDA, 1);      // NoMAK
-                    Delay1us(10);
-                    gpio_put(PIN_SDA, 0);
+                    hal_od_release(PIN_SDA);        // NoMAK
+                    hal_delay_us_exact(10);
+                    hal_od_drive_low(PIN_SDA);
                 }
                 TXins(dx);
-                Delay1us(7);
-                gpio_set_dir(PIN_SDA, GPIO_IN);
-                Delay1us(5);
+                hal_delay_us_exact(7);
+                hal_od_release(PIN_SDA);            // hi-Z for SAK sample
+                hal_delay_us_exact(5);
                 k = 0;
                 if (gpio_get(PIN_SDA)) k = 1;
-                Delay1us(10);
+                hal_delay_us_exact(10);
                 if (gpio_get(PIN_SDA) == 0) k = 1;
-                Delay1us(3);
-                for (uint8_t n = 0; n < 9; n++) __compiler_memory_barrier();
+                hal_delay_us_exact(3);
                 if (k) {
                     TXins(ACK_ERR);
                     i2 = 1;

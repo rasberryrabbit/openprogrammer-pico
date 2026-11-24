@@ -1,0 +1,116 @@
+; ow.pio — One-Wire bus engine for the Open Programmer Pico port.
+;
+; One-Wire is an open-drain single-wire bus with strict timing windows:
+;   reset:        480 us low (drive), 70 us wait, sample presence, 410 us release
+;   write-1 slot: 6 us low, 64 us release
+;   write-0 slot: 60 us low, 10 us release
+;   read slot:    6 us low, 9 us wait, sample @ ~15 us, 55 us release
+;
+; Open-drain emulation: the pin LEVEL is held at 0 forever. Bus state is
+; controlled by DIRECTION only:
+;   set pindirs, 1  -> output  -> drives the bus LOW
+;   set pindirs, 0  -> input   -> releases the bus (external 4.7k pull-up
+;                                  brings it HIGH). Reading the pin now
+;                                  samples the bus level.
+;
+; Clock: the SM runs at 1 MHz (host sets clkdiv = f_sys / 1e6), so one PIO
+; cycle = 1 us. Delay fields (max 31) cover short waits; long waits use
+; counted Y loops where each iteration is 2 us (a 1-delay self-branch).
+;
+; Protocol: the host pushes a command word to the TX FIFO. The low 2 bits
+; select the operation:
+;   0 = write 0   (60 us low + 10 us release)
+;   1 = write 1   ( 6 us low + 64 us release)
+;   2 = read      ( 6 us low, sample @ 15 us, release)
+;   3 = reset     (480 us low, sample presence @ 550 us, release @ 960 us)
+; For read/reset the SM pushes a 32-bit word (bit 0 = sampled value) to
+; the RX FIFO; for write the SM does not push.
+;
+; The program uses .wrap to return to the top (pull block) after every
+; operation, so no explicit jump-to-start is needed. The dispatch is via
+; the X-decrement chain (each JMP X-- fires only for one specific cmd
+; value and falls through otherwise).
+;
+; Pin map (matches hal.h):
+;   OW bus = PIN_SDA = GP10  -> SET side drives pindirs (1 pin)
+;                               IN  side samples the pin level
+
+.program ow
+.define public CMD_WRITE0 0
+.define public CMD_WRITE1 1
+.define public CMD_READ   2
+.define public CMD_RESET  3
+
+.wrap_target
+    pull block              ; 0: wait for command word
+    out x, 2                ; 1: X = cmd[1:0]
+    jmp x-- do_reset        ; 2: cmd==3? X->2, jump
+    jmp x-- do_read         ; 3: cmd==2? X->1, jump
+    jmp x-- do_write1       ; 4: cmd==1? X->0, jump
+                            ;    cmd==0 falls through to write0
+
+do_write0:                  ;    write 0: 60 us low + 10 us release
+    set pindirs, 1          ; 5: drive low
+    set y, 28               ; 6: loop 28x (28*2=56 us) + overhead ~60 us
+w0_loop:
+    jmp y-- w0_loop   [1]   ; 7: 2 us/iter
+    set pindirs, 0    [9]   ; 8: release, 10 us
+    jmp 0                   ; 9: back to pull block (top)
+
+do_write1:                  ;    write 1: 6 us low + 64 us release
+    set pindirs, 1    [5]   ; 10: drive low, 6 us
+    set y, 31               ; 11: loop 31x (31*2=62 us)
+w1_loop:
+    jmp y-- w1_loop   [1]   ; 12: 2 us/iter
+    set pindirs, 0    [1]   ; 13: release, 2 us -> ~64 us total
+    jmp 0                   ; 14: back to pull block (top)
+
+do_read:                    ;    read: 6 us low, sample @15 us, release
+    set pindirs, 1    [5]   ; 15: drive low, 6 us
+    set pindirs, 0    [8]   ; 16: release, wait 9 us (sample @ ~15 us)
+    in pins, 1              ; 17: sample bus -> ISR
+    set y, 26               ; 18: loop 26x (52 us) -> slot ~70 us
+rd_loop:
+    jmp y-- rd_loop   [1]   ; 19: 2 us/iter
+    push block              ; 20: push sampled bit to RX FIFO
+    jmp 0                   ; 21: back to pull block (top)
+
+do_reset:                   ;    reset: 480 us low, sample @550 us, recovery
+    set pindirs, 1          ; 22: drive low
+    set x, 8                ; 23: outer loop 8x
+rst_outer:
+    set y, 29               ; 24: inner loop 30x (30*2=60 us)
+rst_low:
+    jmp y-- rst_low   [1]   ; 25: 2 us/iter -> 60 us inner
+    jmp x-- rst_outer [1]   ; 26: outer 8x -> 8*(60+2) = 496 us ~480 us low
+    set pindirs, 0          ; 27: release
+    set y, 31               ; 28: wait ~62 us into presence window
+rst_wait:
+    jmp y-- rst_wait  [1]   ; 29: 2 us/iter -> 62 us (close to 70 us)
+    in pins, 1              ; 30: sample presence (0=device present)
+    push block              ; 31: push presence bit to RX FIFO
+                            ;    recovery handled by host waiting before
+                            ;    next command (avoids overrunning 32 instr)
+.wrap
+
+% c-sdk {
+// Initialise the One-Wire SM. clkdiv must be set so the SM runs at 1 MHz
+// (one PIO cycle = 1 us): div = (float)clock_get_hz(clk_sys) / 1e6f.
+// The OW pin is configured as open-drain: level 0, direction input
+// (released) at init. The SM toggles direction via "set pindirs".
+static inline void ow_program_init(PIO pio, uint sm, uint offset,
+                                   uint pin, float div) {
+    pio_gpio_init(pio, pin);
+    gpio_put(pin, 0);                                  // level 0 forever
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false); // start released
+
+    pio_sm_config c = ow_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin, 1);           // SET drives pindirs
+    sm_config_set_in_pins(&c, pin);               // IN samples the pin
+    sm_config_set_in_shift(&c, true, false, 32);  // shift right, no autopush
+    sm_config_set_out_shift(&c, true, false, 32); // shift right, no autopull
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

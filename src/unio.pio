@@ -1,0 +1,57 @@
+; unio.pio — UNI/O Manchester half-bit shift engine for the Open Programmer
+; Pico port.
+;
+; UNI/O is a single-wire, open-drain bus using Manchester encoding at a
+; nominal 50 kHz bit rate (T = 10 us per half-bit). Each byte = 8 bits =
+; 16 half-bit periods. The host pre-encodes each byte into a 16-bit
+; DIRECTION pattern (bit 15 = first half-bit):
+;   1 = release the bus (input -> pulled HIGH by the external pull-up)
+;   0 = drive the bus LOW (output, level held 0)
+; This matches the open-drain emulation used by ow.pio: the pin LEVEL is
+; held at 0 forever and only the DIRECTION is toggled.
+;
+; The host pushes the 16-bit direction pattern (right-justified in a
+; 32-bit word, MSB = first half-bit). The SM shifts it out one bit per
+; PIO cycle into pindirs, each held for T (10 us). After 16 half-bits it
+; pushes a dummy completion word to the RX FIFO so the host can
+; synchronise.
+;
+; Pin map (matches hal.h):
+;   SC (UNI/O bus) = PIN_SDA = GP10 -> OUT side drives pindirs (1 pin)
+;                                       IN  side samples the pin level
+;
+; Clock: SM runs at 100 kHz (clkdiv = f_sys / 1e5), one PIO cycle = 10 us
+; = one UNI/O half-bit (T).
+
+.program unio
+
+.wrap_target
+    pull block              ; 0: wait for the 16-bit direction pattern
+    set y, 15               ; 1: 16 half-bits (loop 15 times + first pass)
+hb_loop:
+    out pindirs, 1          ; 2: shift next direction bit -> pindirs
+    jmp y-- hb_loop         ; 3: repeat (2 cycles per half-bit = 2T)
+    out pindirs, 1          ; 4: emit the 16th half-bit
+    push block              ; 5: signal completion to the host
+.wrap
+
+% c-sdk {
+// Initialise the UNI/O SM. clkdiv must be set so one PIO cycle = T (10 us
+// at 50 kHz UNI/O): div = (float)clock_get_hz(clk_sys) / 1e5f.
+// The SC pin is open-drain: level 0, direction input (released) at init.
+static inline void unio_program_init(PIO pio, uint sm, uint offset,
+                                     uint pin, float div) {
+    pio_gpio_init(pio, pin);
+    gpio_put(pin, 0);                                  // level 0 forever
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false); // start released
+
+    pio_sm_config c = unio_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pin, 1);           // OUT drives pindirs
+    sm_config_set_in_pins(&c, pin);               // IN samples the pin
+    sm_config_set_out_shift(&c, true, false, 32); // shift right, MSB first
+    sm_config_set_in_shift(&c, true, false, 32);
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

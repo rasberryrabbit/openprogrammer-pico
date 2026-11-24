@@ -41,6 +41,7 @@
 #include "instructions.h"
 #include "opcontrol_helpers.h"
 #include "usb_app.h"
+#include "pio_drivers.h"
 
 //********Misc.********
 // On RP2040 we always use the software I2C / software SPI implementations
@@ -1833,51 +1834,25 @@ static void ParseCommands(void) {
     }
 
     // ---- One-Wire (SDA = RB0) ---------------------------------------------
+    // Driven by the RP2040 PIO state machine (ow.pio) for jitter-free
+    // slot timing. The PIO handles reset/presence, write-0/write-1 slots
+    // and read slots in hardware; the CPU just pushes commands and drains
+    // the RX FIFO.
     case OW_RESET: {
-        // Reset pulse; return 1 if presence detected.
-        // Uses open-drain emulation (direction toggles, level held 0) and
-        // RAM-resident exact microsecond delays so the 480 us reset / 70 us
-        // presence-sample / 410 us recovery windows are jitter-free.
         TXins(OW_RESET);
-        hal_od_init(PIN_SDA);               // level 0, released (input)
-        uint32_t st = save_and_disable_interrupts();
-        hal_od_drive_low(PIN_SDA);          // bus low
-        hal_delay_us_exact(480);            // reset low time (spec: >=480us)
-        hal_od_release(PIN_SDA);            // release (pull-up)
-        hal_delay_us_exact(70);             // wait into presence window
-        if (gpio_get(PIN_SDA) == 0) TXins(1);   // presence detected
-        else TXins(0);
-        hal_delay_us_exact(410);            // recovery (spec: >=480us total)
-        restore_interrupts(st);
+        bool present = ow_pio_reset();
+        TXins(present ? 1 : 0);
         break;
     }
 
     case OW_WRITE: {
-        // Write N bytes LSB first. Open-drain + exact-timing slot edges.
-        // Write-1 slot: 6 us low + 64 us release.
-        // Write-0 slot: 60 us low + 10 us release.
+        // Write N bytes LSB first via the PIO One-Wire engine.
         TXins(OW_WRITE);
         i = receive_buffer[++RXptr];
         if (RXptr + i < number_of_bytes_read) {
-            uint8_t k;
-            hal_od_init(PIN_SDA);
             for (; i; i--) {
                 i2 = receive_buffer[++RXptr];
-                uint32_t st = save_and_disable_interrupts();
-                for (k = 8; k > 0; k--) {
-                    hal_od_drive_low(PIN_SDA);      // start pulse
-                    if (i2 & 1) {
-                        hal_delay_us_exact(6);      // write-1 recovery window
-                        hal_od_release(PIN_SDA);
-                        hal_delay_us_exact(64);
-                    } else {
-                        hal_delay_us_exact(60);     // write-0 low time
-                        hal_od_release(PIN_SDA);
-                        hal_delay_us_exact(10);
-                    }
-                    i2 >>= 1;
-                }
-                restore_interrupts(st);
+                ow_pio_write_byte(i2);
             }
         } else {
             TXins(RX_ERR);
@@ -1887,29 +1862,14 @@ static void ParseCommands(void) {
     }
 
     case OW_READ: {
-        // Read N bytes LSB first. Open-drain + exact-timing read slot:
-        //   6 us low, release, sample @ ~15 us, release until 70 us.
+        // Read N bytes LSB first via the PIO One-Wire engine.
         TXins(OW_READ);
         i = receive_buffer[++RXptr];
         if (RXptr < number_of_bytes_read &&
             TXptr + i < HID_INPUT_REPORT_BYTES) {
-            uint8_t k;
             TXins(i);
-            hal_od_init(PIN_SDA);
             for (; i; i--) {
-                uint32_t st = save_and_disable_interrupts();
-                i2 = 0;
-                for (k = 8; k > 0; k--) {
-                    hal_od_drive_low(PIN_SDA);      // start pulse
-                    hal_delay_us_exact(6);
-                    hal_od_release(PIN_SDA);        // release for master read
-                    hal_delay_us_exact(9);          // sample at ~15 us
-                    i2 >>= 1;
-                    if (gpio_get(PIN_SDA)) i2 += 0x80;
-                    hal_delay_us_exact(55);         // finish slot (>=60us tot)
-                }
-                TXins(i2);
-                restore_interrupts(st);
+                TXins(ow_pio_read_byte());
             }
         } else {
             TXins(RX_ERR);
@@ -1982,23 +1942,23 @@ static void ParseCommands(void) {
                     i = i2 = 0;
                 }
             }
-            // Send N bytes (MSB first).
+            // Send N bytes (MSB first). Each byte is Manchester-encoded
+            // into a 16-bit direction pattern and emitted by the UNI/O PIO
+            // state machine (unio.pio) for jitter-free half-bit edges at
+            // 50 kHz. SAK sampling and MAK/NoMAK remain host-driven.
             for (; i; i--) {
                 dx = receive_buffer[++RXptr];
-                hal_od_drive_low(PIN_SDA);
+                // Encode 8 data bits Manchester: bit=1 -> high,low (1,0);
+                // bit=0 -> low,high (0,1). Build the 16-bit pattern MSB
+                // first (first half-bit = bit 15).
+                uint16_t pat = 0;
                 for (k = 8; k > 0; k--) {
-                    if (dx & 0x80) {
-                        hal_od_drive_low(PIN_SDA);
-                        hal_delay_us_exact(10);
-                        hal_od_release(PIN_SDA);
-                    } else {
-                        hal_od_release(PIN_SDA);
-                        hal_delay_us_exact(10);
-                        hal_od_drive_low(PIN_SDA);
-                    }
-                    hal_delay_us_exact(8);
+                    pat <<= 2;
+                    if (dx & 0x80) pat |= 0b10;   // 1 -> high,low
+                    else           pat |= 0b01;   // 0 -> low,high
                     dx <<= 1;
                 }
+                unio_pio_emit_halfbits(pat);
                 if (i2 || i > 1) {
                     hal_od_drive_low(PIN_SDA);      // MAK
                     hal_delay_us_exact(10);

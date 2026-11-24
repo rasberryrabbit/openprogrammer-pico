@@ -163,12 +163,24 @@ JTAG / One-Wire / UNI/O / Microwire 프로토콜은 마이크로초 단위의
    방향만 토글하여 OD를 에뮬레이션합니다. 레벨 설정 오버헤드가
    없어 슬롯 엣지가 더 정확합니다.
 
-> **참고 — PIO(Programmable I/O)**: RP2040의 PIO는 CPU와 무관하게
-> 하드웨어에서 타이밍을 보장하는 가장 이상적인 방법입니다. 현재
-> 빌드 환경에서 pioasm 도구를 사용할 수 없어 PIO 구현은 보류하고
-> RAM-resident 방식으로 충분한 정밀도를 확보했습니다. pioasm 확보 시
-> One-Wire와 JTAG에 PIO를 추가 적용해 CPU 부하를 완전히 제거할 수
-> 있습니다. 자세한 설계는 `docs/TIMING_DESIGN.md`를 참고하세요.
+> **PIO(Programmable I/O) 적용 완료**: RP2040의 PIO는 CPU와 무관하게
+> 하드웨어에서 타이밍을 보장하는 가장 이상적인 방법입니다. pioasm
+> 어셈블러를 pico-sdk 소스에서 빌드하여 빌드 파이프라인에 통합했고,
+> 4개 프로토콜(One-Wire, JTAG, UNI/O, Microwire)용 `.pio` 프로그램을
+> 작성했습니다:
+>
+> - **One-Wire** (`src/ow.pio`, 32명령): reset/presence/write-0/write-1/read
+>   슬롯을 1MHz PIO 클럭으로 하드웨어 보장. 오픈드레인은 `set pindirs`로.
+> - **UNI/O** (`src/unio.pio`, 6명령): Manchester 하프비트 16개를 100kHz로
+>   시프트. 호스트가 바이트를 16비트 방향 패턴으로 인코딩.
+> - **JTAG** (`src/jtag.pio`): 32비트 시프트 엔진 + TMS 펄스 엔진.
+> - **Microwire** (`src/uw.pio`, 8명령): 32비트 동시 송수신 시프트 엔진.
+>
+> PIO 드라이버(`src/pio_drivers.c`, `include/pio_drivers.h`)가 5개 상태머신을
+> 관리하며, `opcontrol.c`의 OW_RESET/OW_WRITE/OW_READ와 UNIO_COM 송신부가
+> PIO 기반 호출로 교체됐습니다. JTAG XFER와 uW는 기존 RAM-resident 정밀
+> 타이밍이 이미 충분해 PIO 엔진은 향후 대량 시프트 최적화용으로 예비됩니다.
+> 자세한 설계는 `docs/TIMING_DESIGN.md`를 참고하세요.
 
 ### 6.4 DCDC 제어 루프
 원본은 CCP2 compare 인터럽트(250us 주기, 4kHz)에서 PID 변종 제어 루프를 실행합니다. RP2040에서는 `add_repeating_timer_us(250, ...)`로 동일한 주기의 타이머 알람을 설정했고, `timer_isr()` 함수 본체는 제어 계수(`pwm += errz*225; pwm -= err*228`)를 그대로 보존했습니다.

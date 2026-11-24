@@ -21,6 +21,7 @@
 #include "hal.h"
 #include "OPcontrol.h"
 #include "usb_app.h"
+#include "pio_drivers.h"
 
 // On the pico-sdk + TinyUSB device port, board_init() is provided by the
 // tinyusb_board library (which wraps pico_stdlib's stdio_init_all and clock
@@ -38,6 +39,10 @@ int main(void) {
     // delay primitives (hal_delay_us_exact / hal_delay_ns_exact). Must
     // run AFTER board_init() so the clock is at its final 133 MHz.
     hal_timing_init();
+    // Load the PIO programs (One-Wire, JTAG, UNI/O, Microwire) into the
+    // RP2040 PIO blocks and configure the state machines. Done at boot so
+    // the SMs are ready when the first protocol command arrives.
+    pio_drivers_init();
     usb_app_init();
     // BOARD_TUD_RHPORT is 0 on RP2040 (single USB port). Use the literal
     // since the BSP header is not included on the pico-sdk build.

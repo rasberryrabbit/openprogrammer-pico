@@ -1,0 +1,85 @@
+; uw.pio — Microwire (uW) shift engine for the Open Programmer Pico port.
+;
+; Microwire is a simple clocked serial protocol: the master clocks uWCK
+; and presents one data bit (uWDI) per clock edge; the slave returns one
+; bit (uWDO) on the opposite edge. Bits are MSB-first.
+;
+; This PIO program shifts N bits out on uWDI while simultaneously shifting
+; N bits in from uWDO. The host CPU pushes the 32-bit TX word (bits
+; MSB-aligned); the SM shifts them out and pushes back a 32-bit RX word
+; (bits MSB-aligned) containing the sampled input.
+;
+; Pin map (matches hal.h):
+;   uWDI (data out from master) = PIN_SDO = GP27  -> OUT side, 1 pin
+;   uWDO (data in to master)    = PIN_SDA = GP10  -> IN  side, 1 pin
+;   uWCK (clock)                = PIN_SCL = GP11  -> SET side, 1 pin
+;
+; Clock: the SM runs at clk_sys / clkdiv. The host sets clkdiv to hit the
+; target uWCK frequency: f_uWCK = f_sys / (2 * clkdiv) (each bit takes 2
+; PIO cycles: one low, one high).
+;
+; Protocol (8-bit shift shown; the host writes the bit count into Y):
+;   .wrap_target
+;   pull block              ; wait for TX word (the data to shift out)
+;   out x, 32               ; X = TX word (the bits, MSB-first in OSR)
+;   set pins, 0             ; uWCK low (idle)
+;   ; --- bit loop (Y iterations) ---
+;   loop:
+;     mov pins, x @ 1       ; drive MSB of X onto uWDI      (cycle 0)
+;     set pins, 1           ; uWCK rising edge -> latch      (cycle 1)
+;     in pins, 1            ; sample uWDO into ISR           (cycle 2)
+;     jmp x_dec, shift      ; --X (we use X>>1 below)
+;   ... we use OSR shifting instead; see the encoded program below.
+;
+; Encoded program (8 instructions). We shift the TX word right (LSB-first
+; in the OSR after an initial bit-reverse, or MSB-first via the JMP_X_DEC
+; trick). Below we use the autopush/autopull mechanism: the host pushes a
+; 32-bit word whose MSB is the first bit to send; OUT pins,1 then shifts
+; one bit at a time MSB-first to uWDI, while IN pins,1 shifts the sampled
+; uWDO bit into the ISR. After 32 bits the ISR auto-pushes to the RX FIFO.
+;
+; For sub-32-bit transfers the host sets Y to the bit count and the SM
+; stops after Y bits, pushing whatever is in the ISR (right-justified).
+
+.program uw
+.define public BITS_PER_WORD 32
+
+; Inputs:  uWDO on IN pin (PIN_SDA, GP10)
+; Outputs: uWDI on OUT pin (PIN_SDO, GP27)
+; Set:     uWCK on SET pin (PIN_SCL, GP11)
+
+.wrap_target
+    pull block          ; wait for the next 32-bit TX word from the host
+    set y, 31           ; loop 32 times (bits 0..31, MSB first)
+bitloop:
+    out pins, 1         ; shift 1 bit MSB-first from OSR -> uWDI
+    set pins, 1         ; uWCK rising edge (slave latches uWDI)
+    in pins, 1          ; sample uWDO -> ISR (slave drives on rising edge)
+    set pins, 0         ; uWCK falling edge
+    jmp y-- bitloop     ; repeat for all 32 bits
+    push block          ; push the 32-bit sampled word to RX FIFO
+.wrap
+
+% c-sdk {
+static inline void uw_program_init(PIO pio, uint sm, uint offset, uint pin_wdi, uint pin_wdo, uint pin_wck, float div) {
+    // uWDI: output, driven by the SM's OUT side.
+    pio_gpio_init(pio, pin_wdi);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_wdi, 1, true);
+    // uWDO: input, sampled by the SM's IN side.
+    pio_gpio_init(pio, pin_wdo);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_wdo, 1, false);
+    // uWCK: output, driven by the SM's SET side.
+    pio_gpio_init(pio, pin_wck);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_wck, 1, true);
+
+    pio_sm_config c = uw_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pin_wdi, 1);   // OUT drives uWDI
+    sm_config_set_in_pins(&c, pin_wdo);       // IN samples uWDO
+    sm_config_set_set_pins(&c, pin_wck, 1);   // SET drives uWCK
+    sm_config_set_out_shift(&c, true, false, 32);  // shift right, no autopull, 32 bits
+    sm_config_set_in_shift(&c, true, false, 32);   // shift right, no autopush, 32 bits
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

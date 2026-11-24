@@ -1,0 +1,100 @@
+; jtag.pio — JTAG shift engine for the Open Programmer Pico port.
+;
+; JTAG shifts bits through a chain: the master presents TDI on each TCK
+; rising edge and samples TDO on the same edge. The TAP state machine is
+; advanced via TMS. Open Programmer mostly does long DR/IR shifts (XSC
+; data register access), so this program optimises for that: a high-speed
+; 32-bit (or N-bit) shift with TMS held low (Shift-DR / Shift-IR state).
+;
+; Two programs are provided:
+;   jtag_shift  — shift N bits (TMS=0), MSB-first, TDI out / TDO in.
+;   jtag_tms    — clock N TMS bits (with TDI=0), for state-machine walking.
+;
+; Pin map (matches hal.h):
+;   TCK = PIN_CK = GP6  -> SET side (clock), 1 pin
+;   TDI = PIN_PGM = GP7 -> OUT side (data out), 1 pin
+;   TDO = PIN_D = GP5   -> IN  side (data in), 1 pin
+;   TMS = PIN_A1 = GP15 -> driven by the host CPU directly (not via PIO),
+;                          because TMS changes are infrequent (state walk)
+;                          and the host can do them in C without jitter
+;                          affecting the critical TCK/TDI/TDO shift path.
+;
+; Clock: f_TCK = f_sys / (2 * clkdiv). At clk_sys=125 MHz and clkdiv=1,
+; TCK reaches 62.5 MHz (well above any real JTAG device's max). The host
+; sets clkdiv to the device's rated TCK frequency.
+
+; ---------------------------------------------------------------------------
+; jtag_shift: shift 32 bits MSB-first, TCK one pulse per bit.
+;   Host pushes a 32-bit TX word (MSB = first bit out); SM shifts out TDI
+;   and samples TDO, pushing a 32-bit RX word back (MSB = first bit in).
+; ---------------------------------------------------------------------------
+.program jtag_shift
+
+.wrap_target
+    pull block          ; wait for the next 32-bit TX word
+    set y, 31           ; 32 bits (MSB first)
+shift_loop:
+    out pins, 1         ; TDI = next TX bit (MSB first)
+    set pins, 1         ; TCK rising edge (TAP latches TDI; TDO valid)
+    in pins, 1          ; sample TDO -> ISR
+    set pins, 0         ; TCK falling edge
+    jmp y-- shift_loop  ; repeat for all 32 bits
+    push block          ; push the 32-bit RX word
+.wrap
+
+; ---------------------------------------------------------------------------
+; jtag_tms: clock N TMS bits (TDI held 0). Used to walk the TAP state
+;   machine (e.g. Test-Logic-Reset, Select-DR, Capture-DR, Shift-DR).
+;   The host drives TMS via gpio_put() directly; this program just pulses
+;   TCK N times. The host sets the TMS level before calling.
+;   Host pushes the bit count (minus 1) as a 32-bit word.
+; ---------------------------------------------------------------------------
+.program jtag_tms
+
+.wrap_target
+    pull block          ; wait for bit count (in the low bits of the word)
+    out y, 32           ; Y = bit count
+tms_loop:
+    set pins, 1         ; TCK rising edge (TAP latches TMS)
+    set pins, 0         ; TCK falling edge
+    jmp y-- tms_loop    ; repeat
+.wrap
+
+% c-sdk {
+// Initialise the jtag_shift SM. TMS is left to the host (gpio_put on
+// PIN_A1). div sets the TCK frequency: f_TCK = f_sys / (2 * div).
+static inline void jtag_shift_program_init(PIO pio, uint sm, uint offset,
+                                           uint pin_tdi, uint pin_tdo,
+                                           uint pin_tck, float div) {
+    pio_gpio_init(pio, pin_tdi);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_tdi, 1, true);
+    pio_gpio_init(pio, pin_tdo);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_tdo, 1, false);
+    pio_gpio_init(pio, pin_tck);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_tck, 1, true);
+
+    pio_sm_config c = jtag_shift_program_get_default_config(offset);
+    sm_config_set_out_pins(&c, pin_tdi, 1);   // OUT -> TDI
+    sm_config_set_in_pins(&c, pin_tdo);       // IN  <- TDO
+    sm_config_set_set_pins(&c, pin_tck, 1);   // SET -> TCK
+    sm_config_set_out_shift(&c, true, false, 32);
+    sm_config_set_in_shift(&c, true, false, 32);
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+// Initialise the jtag_tms SM (TCK pulses only).
+static inline void jtag_tms_program_init(PIO pio, uint sm, uint offset,
+                                         uint pin_tck, float div) {
+    pio_gpio_init(pio, pin_tck);
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_tck, 1, true);
+
+    pio_sm_config c = jtag_tms_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, pin_tck, 1);
+    sm_config_set_out_shift(&c, true, false, 32);
+    sm_config_set_clkdiv(&c, div);
+    pio_sm_init(pio, sm, offset, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

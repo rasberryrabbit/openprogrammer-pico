@@ -21,27 +21,39 @@ pico_sdk_init()
 # We use RP2040's PIO coprocessor for jitter-free bit-bang of One-Wire,
 # JTAG, UNI/O and Microwire. pioasm compiles .pio source files into C
 # headers at build time. The SDK ships pico_generate_pio_header() in
-# tools/CMakeLists.txt; we include that here, and point it at a locally
-# built pioasm binary (set Pioasm to its absolute path).
+# tools/CMakeLists.txt; we include that here, and point it at a prebuilt
+# pioasm binary.
 #
 # The pico_generate_pio_header() function looks for the executable in the
 # `Pioasm` imported target (see pico-sdk/tools/CMakeLists.txt +
 # FindPioasm.cmake). FindPioasm.cmake builds pioasm from source via
 # ExternalProject, which fails under cmake 4.x (the bundled pioasm
-# CMakeLists.txt requires cmake_minimum_required(VERSION 3.4)). We already
-# have a prebuilt pioasm binary, so we define the imported target directly
-# and set Pioasm_FOUND to short-circuit FindPioasm.cmake.
-if (NOT Pioasm_EXECUTABLE)
-    set(_PIOASM_DEFAULT "/home/z/my-project/tools/bin/pioasm")
-    if (EXISTS "${_PIOASM_DEFAULT}")
-        set(Pioasm_EXECUTABLE "${_PIOASM_DEFAULT}")
+# CMakeLists.txt requires cmake_minimum_required(VERSION 3.4)). We use a
+# prebuilt pioasm binary, so we define the imported target directly and
+# set Pioasm_FOUND to short-circuit FindPioasm.cmake.
+#
+# How to provide the pioasm binary (in priority order):
+#   1. -DPICO_PIOASM_EXECUTABLE=/path/to/pioasm  on the cmake command line
+#   2. $PICO_PIOASM_EXECUTABLE environment variable
+#   3. ${PICO_SDK_PATH}/tools/pioasm/build/pioasm  (built in-tree)
+#   4. `which pioasm`  (system-installed)
+# If none is found, we fall back to FindPioasm.cmake's source build (works
+# on cmake 3.x). See README.md "Building pioasm" for how to build pioasm
+# from the pico-sdk sources.
+if (NOT PICO_PIOASM_EXECUTABLE)
+    if (DEFINED ENV{PICO_PIOASM_EXECUTABLE})
+        set(PICO_PIOASM_EXECUTABLE $ENV{PICO_PIOASM_EXECUTABLE})
+    elseif (EXISTS "${PICO_SDK_PATH}/tools/pioasm/build/pioasm")
+        set(PICO_PIOASM_EXECUTABLE "${PICO_SDK_PATH}/tools/pioasm/build/pioasm")
+    else()
+        find_program(PICO_PIOASM_EXECUTABLE pioasm)
     endif()
-    unset(_PIOASM_DEFAULT)
 endif()
-if (Pioasm_EXECUTABLE AND NOT TARGET Pioasm)
+if (PICO_PIOASM_EXECUTABLE AND NOT TARGET Pioasm)
     add_executable(Pioasm IMPORTED)
-    set_property(TARGET Pioasm PROPERTY IMPORTED_LOCATION ${Pioasm_EXECUTABLE})
+    set_property(TARGET Pioasm PROPERTY IMPORTED_LOCATION ${PICO_PIOASM_EXECUTABLE})
     set(Pioasm_FOUND 1)
+    message(STATUS "Using prebuilt pioasm: ${PICO_PIOASM_EXECUTABLE}")
 endif()
 include(${PICO_SDK_PATH}/tools/CMakeLists.txt)
 

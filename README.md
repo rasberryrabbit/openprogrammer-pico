@@ -69,16 +69,53 @@ Firmware_Pico/
 
 ### 요구사항
 - `arm-none-eabi-gcc` (버전 10.3 이상, GCC ARM Embedded)
-- `cmake` 3.13+
+- `cmake` 3.13+ (pioasm 소스 빌드 시에는 3.x 권장; 4.x는 사전 빌드된 pioasm 사용)
 - `ninja` 또는 `make`
 - `pico-sdk` 1.5+ 체크아웃
 - `tinyusb` (pico-sdk에 포함)
+- `pioasm` (아래 참고)
+
+### pioasm 준비 (PIO 어셈블러)
+
+이 펌웨어는 4개 `.pio` 프로그램(One-Wire, JTAG, UNI/O, Microwire)을
+빌드 타임에 C 헤더로 컴파일합니다. pico-sdk 소스 트리에 포함된
+pioasm를 빌드해서 사용합니다:
+
+```bash
+# pico-sdk에 포함된 pioasm 소스 빌드 (cmake 3.x)
+cd $PICO_SDK_PATH/tools/pioasm
+mkdir build && cd build
+cmake ..
+make
+
+# 결과: $PICO_SDK_PATH/tools/pioasm/build/pioasm
+```
+
+cmake 4.x 환경에서는 cmake_minimum_required 호환성 오류가 나므로 정책
+버전을 명시하세요:
+
+```bash
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+```
+
+빌드한 pioasm 경로는 cmake가 다음 순서로 자동 탐색합니다:
+
+1. `-DPICO_PIOASM_EXECUTABLE=/path/to/pioasm` (cmake 명령행)
+2. `$PICO_PIOASM_EXECUTABLE` 환경 변수
+3. `$PICO_SDK_PATH/tools/pioasm/build/pioasm` (인트리 빌드)
+4. `which pioasm` (시스템 설치)
+
+어느 것도 없으면 FindPioasm.cmake가 pioasm를 소스에서 빌드합니다
+(cmake 3.x에서만 동작).
 
 ### 빌드 명령
 
 ```bash
 # pico-sdk 경로 설정 (환경에 맞게 수정)
 export PICO_SDK_PATH=/path/to/pico-sdk
+
+# (선택) 사전 빌드한 pioasm 경로 지정 — 자동 탐색되면 생략 가능
+# export PICO_PIOASM_EXECUTABLE=/path/to/pioasm
 
 # 빌드 디렉토리
 cd Firmware_Pico

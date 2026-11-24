@@ -142,6 +142,9 @@ extern "C" {
 //   CKpulseL() -> long (~750 ns, used for PIC24 SIX)
 // On RP2040 at 133 MHz we use the RAM-resident exact cycle-counted delay
 // (hal_delay_cycles) so CK half-periods are deterministic, not "at least".
+// PIN_CK stays on SIO for the whole firmware: JTAG is host-driven bit-bang
+// (TCKpulse -> CKpulse here) and never goes through a PIO block, so its
+// FUNCSEL is never taken by pio_gpio_init().
 #define CKpulse()     do { gpio_put(PIN_CK,1); __compiler_memory_barrier(); \
                            gpio_put(PIN_CK,0); } while(0)
 #define CKpulseN()    do { gpio_put(PIN_CK,1); hal_delay_cycles(8); \

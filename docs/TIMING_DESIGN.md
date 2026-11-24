@@ -127,34 +127,54 @@ PIO 드라이버(`src/pio_drivers.c`)에서 include됩니다.
 
 ### 4.3 PIO 상태머신 할당
 
-RP2040은 2개 PIO 블록(pio0, pio1), 각 4개 상태머신(SM)과 32명령 슬롯을
-가집니다. 5개 SM을 사용합니다:
+RP2040은 2개 PIO 블록(pio0, pio1)이 있고, 각 블록은 4개 상태머신(SM)과
+**32명령 슬롯**(블록 내 모든 SM이 공유)을 가집니다. 한 블록에 들어가는
+프로그램 명령 수 합계가 32를 넘으면 `pio_add_program`이 런타임에
+실패합니다. ow.pio 단독으로 32명령이라 pio0을 OW 전용으로 쓰고, UNI/O
+(6명령)는 pio1에 넣습니다:
 
 ```
-pio0 SM0 — One-Wire   (ow.pio,            32 instr)
-pio0 SM1 — UNI/O      (unio.pio,           6 instr)
-pio0 SM2 — JTAG shift (jtag_shift,         8 instr)
-pio0 SM3 — JTAG TMS   (jtag_tms,           4 instr)
-pio1 SM0 — Microwire  (uw.pio,             8 instr)
+pio0 SM0 — One-Wire   (ow.pio,            32 instr — 블록 전용)
+pio1 SM0 — UNI/O      (unio.pio,           6 instr)
 ```
 
-OW/UNIO는 PIN_SDA를 공유하고 JTAG/uW는 다른 핀을 쓰므로 두 PIO 블록을
-분리해 SET/OUT 핀 매핑 충돌을 피했습니다.
+JTAG(TCK/TDI/TDO/TMS)과 Microwire(uWCK/uWDI/uWDO)는 **SIO 호스트
+비트뱅**으로 유지합니다. `pio_gpio_init()`은 핀의 FUNCSEL을 PIO 기능으로
+바꾸고 절대 복구하지 않으므로, 이 핀들을 PIO에 넘기면 `gpio_put()`/
+`gpio_get()`이 물리 핀에 닿지 않아 비트뱅이 조용히 망가집니다. 이전
+설계는 JTAG/uW PIO 프로그램을 pio1에 로드해 `pio_gpio_init()`이
+TCK/TDI/TDO/uWCK/uWDI의 FUNCSEL을 PIO로 가져갔고, 결과적으로 JTAG/uW
+비트뱅 경로가 실제 하드웨어에서 동작하지 않았습니다. 방안 A 적용으로
+JTAG/uW PIO 로드 자체를 제거해 이 충돌을 원천 해소했습니다.
+
+#### PIN_SDA 지연 소유권 (방안 A)
+
+OW(pio0)와 UNI/O(pio1)는 PIN_SDA(GP10)를 공유합니다. 부트 시
+`pio_drivers_init()`는 두 프로그램을 로드하고 SM을 claim하지만,
+**SM은 비활성화** 상태로 두고 PIN_SDA는 SIO에 남겨둡니다(open-drain,
+released). 프로토콜이 핀을 쓸 때 `<proto>_pio_enter()`가 FUNCSEL을
+소유 PIO 블록으로 바꾸고 SM을 활성화하며, 끝나면 `<proto>_pio_exit()`가
+SM을 끄고 PIN_SDA를 SIO open-drain으로 복원합니다. OW와 UNI/O는
+상호 배타이므로 한 enter가 다른 프로토콜의 exit를 자동 호출합니다.
+호스트는 각 PIO 호출 시퀀스를 enter/exit로 감싸야, 그 사이 SIO
+비트뱅 경로(UNIO_COM의 start header·MAK·SAK, UNIO_STBY)가 정상
+동작합니다.
 
 ### 4.4 opcontrol.c 적용 현황
 
 | 프로토콜 | PIO 적용 | 비고 |
 |----------|----------|------|
-| OW_RESET / OW_WRITE / OW_READ | ✅ PIO | `ow_pio_reset/write_byte/read_byte` 호출 |
-| UNIO_COM (송신부) | ✅ PIO | `unio_pio_emit_halfbits`로 Manchester 하프비트 시프트 |
-| UNIO_STBY | ❌ 호스트 | 단순 펄스라 RAM-resident 유지 |
-| UNIO_COM (SAK 샘플링) | ❌ 호스트 | 적응 타이밍 필요해 PIO 부적합 |
-| JTAG XFER | ❌ 호스트 | 32번째 비트 TMS 전환 로직이 복잡; 현재 `hal_delay_cycles`로 충분 |
-| uW TX/RX | ❌ 호스트 | 비트 단위 패킹이 PIO 32비트 시프트와 매핑 복잡; 현재 정밀 |
+| OW_RESET / OW_WRITE / OW_READ | ✅ PIO | `ow_pio_enter` → `ow_pio_reset/write_byte/read_byte` → `ow_pio_exit` |
+| UNIO_COM (송신부) | ✅ PIO | `unio_pio_enter` → `unio_pio_emit_halfbits` → `unio_pio_exit` (바이트마다) |
+| UNIO_STBY | ❌ 호스트 | `hal_od_*` SIO 비트뱅; PIN_SDA가 SIO에 있어 정상 동작 |
+| UNIO_COM (start header / MAK / SAK / 수신) | ❌ 호스트 | `hal_od_*` SIO 비트뱅; PIO emit 전후로 exit/enter 복귀 |
+| JTAG (SET_MODE / SEND_CMD / XFER) | ❌ 호스트 | `gpio_put(PIN_CK/PIN_PGM/PIN_D/PIN_A1)` SIO 비트뱅; FUNCSEL PIO 미사용 |
+| uW (INIT / TX / RX) | ❌ 호스트 | `gpio_put(PIN_SDO/PIN_SCL)` SIO 비트뱅; FUNCSEL PIO 미사용 |
 
-PIO 엔진(JTAG, uW)은 작성 및 빌드 검증을 마쳤으며, 향후 대량 시프트
-최적화나 더 높은 클럭이 필요할 때 즉시 적용할 수 있는 예비 인프라로
-남겨둡니다.
+JTAG/uW PIO 엔진(jtag.pio, uw.pio)은 더 이상 빌드하지 않습니다.
+SIO 비트뱅이 정밀도와 유연성에서 충분하며, PIO 마이그레이션은
+타이밍 보장이 필수인 OW(1-Wire reset/slot)와 UNI/O(50 kHz Manchester
+하프비트)에만 적용됩니다.
 
 ### 4.5 PIO 타이밍 정확도
 

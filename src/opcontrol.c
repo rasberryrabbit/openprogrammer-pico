@@ -1840,7 +1840,9 @@ static void ParseCommands(void) {
     // the RX FIFO.
     case OW_RESET: {
         TXins(OW_RESET);
+        ow_pio_enter();
         bool present = ow_pio_reset();
+        ow_pio_exit();
         TXins(present ? 1 : 0);
         break;
     }
@@ -1850,10 +1852,12 @@ static void ParseCommands(void) {
         TXins(OW_WRITE);
         i = receive_buffer[++RXptr];
         if (RXptr + i < number_of_bytes_read) {
+            ow_pio_enter();
             for (; i; i--) {
                 i2 = receive_buffer[++RXptr];
                 ow_pio_write_byte(i2);
             }
+            ow_pio_exit();
         } else {
             TXins(RX_ERR);
             receive_buffer[RXptr + 1] = FLUSH;
@@ -1868,9 +1872,11 @@ static void ParseCommands(void) {
         if (RXptr < number_of_bytes_read &&
             TXptr + i < HID_INPUT_REPORT_BYTES) {
             TXins(i);
+            ow_pio_enter();
             for (; i; i--) {
                 TXins(ow_pio_read_byte());
             }
+            ow_pio_exit();
         } else {
             TXins(RX_ERR);
             receive_buffer[RXptr + 1] = FLUSH;
@@ -1958,7 +1964,9 @@ static void ParseCommands(void) {
                     else           pat |= 0b01;   // 0 -> low,high
                     dx <<= 1;
                 }
+                unio_pio_enter();
                 unio_pio_emit_halfbits(pat);
+                unio_pio_exit();
                 if (i2 || i > 1) {
                     hal_od_drive_low(PIN_SDA);      // MAK
                     hal_delay_us_exact(10);

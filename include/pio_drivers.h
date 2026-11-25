@@ -56,8 +56,9 @@ uint8_t ow_pio_read_byte(void);
 // ---- UNI/O (PIO) ---------------------------------------------------------
 // Replaces the inner Manchester half-bit loop of UNIO_COM. The host encodes
 // a byte into a 16-bit direction pattern and pushes it; the SM plays the
-// 16 half-bits at 50 kHz. The host still handles start header, SAK polling,
-// MAK/NoMAK and standby (those need adaptive SIO timing on PIN_SDA).
+// 16 half-bits at 50 kbit/s (10 us/half-bit). The host still handles start
+// header, SAK polling, MAK/NoMAK and standby (those need adaptive SIO timing
+// on PIN_SDA).
 // unio_pio_emit_halfbits() must be bracketed by unio_pio_enter() /
 // unio_pio_exit() so PIN_SDA is owned by pio1 only for the duration of the
 // PIO shift; the surrounding SIO bit-bang sequences (start header, MAK,

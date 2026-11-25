@@ -79,11 +79,14 @@ void pio_drivers_init(void) {
     ow_off  = pio_add_program(ow_pio, &ow_program);
     ow_div  = (float)sys_hz / 1000000.0f;
 
-    // ---- UNI/O on pio1 SM0 (50 kHz = 10 us/cycle = T) ----
+    // ---- UNI/O on pio1 SM0 (50 kbit/s bit rate = 10 us/half-bit) ----
+    // unio.pio spends 2 PIO cycles per half-bit (out pindirs + jmp y--),
+    // so a 10 us half-bit needs a 5 us PIO cycle -> SM at 200 kHz.
+    // div = f_sys / 200e3.
     unio_pio = pio1;
     unio_sm  = pio_claim_unused_sm(unio_pio, true);
     unio_off = pio_add_program(unio_pio, &unio_program);
-    unio_div = (float)sys_hz / 100000.0f;
+    unio_div = (float)sys_hz / 200000.0f;
 
     g_init_done = true;
 }
@@ -103,8 +106,13 @@ void ow_pio_enter(void) {
 void ow_pio_exit(void) {
     if (g_sda_owner != SDA_OW) return;
     pio_sm_set_enabled(ow_pio, ow_sm, false);
-    // Restore PIN_SDA to SIO open-drain (level 0, input/released) so the
-    // host's hal_od_* helpers and other protocols can drive it again.
+    // Restore PIN_SDA to SIO. pio_gpio_init() set FUNCSEL to the PIO0
+    // function; gpio_put()/gpio_set_dir() (used by hal_od_init and the
+    // UNIO bit-bang paths) only touch the SIO output/enable registers and
+    // do NOT restore FUNCSEL, so we must do it explicitly here.
+    gpio_set_function(PIN_SDA, GPIO_FUNC_SIO);
+    // Now back on SIO: re-establish the open-drain idle state
+    // (level 0, input/released) so the host's hal_od_* helpers work.
     hal_od_init(PIN_SDA);
     g_sda_owner = SDA_NONE;
 }
@@ -164,7 +172,13 @@ void unio_pio_enter(void) {
 void unio_pio_exit(void) {
     if (g_sda_owner != SDA_UNIO) return;
     pio_sm_set_enabled(unio_pio, unio_sm, false);
-    // Restore PIN_SDA to SIO open-drain for the host's hal_od_* helpers.
+    // Restore PIN_SDA to SIO. pio_gpio_init() set FUNCSEL to the PIO1
+    // function; gpio_put()/gpio_set_dir() (used by hal_od_init and the
+    // UNIO bit-bang paths) only touch the SIO output/enable registers and
+    // do NOT restore FUNCSEL, so we must do it explicitly here.
+    gpio_set_function(PIN_SDA, GPIO_FUNC_SIO);
+    // Now back on SIO: re-establish the open-drain idle state
+    // (level 0, input/released) so the host's hal_od_* helpers work.
     hal_od_init(PIN_SDA);
     g_sda_owner = SDA_NONE;
 }

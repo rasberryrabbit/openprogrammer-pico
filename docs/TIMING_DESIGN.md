@@ -80,7 +80,7 @@ One-Wire와 UNI/O는 오픈드레인 버스입니다. RP2040은 네이티브
 | 프로토콜 | 핵심 타이밍 | 개선 전 | 개선 후 |
 |----------|------------|---------|---------|
 | One-Wire | reset 480us, slot 6-60us | busy_wait_us ±1us | hal_delay_us_exact ±0us |
-| UNI/O | Manchester 10-20us 하프비트 | Delay1us (busy_wait) | hal_delay_us_exact |
+| UNI/O | Manchester 10us 하프비트 (50 kbit/s) | Delay1us (busy_wait) | hal_delay_us_exact |
 | Microwire | uWCK 8사이클 하프피리어드 | busy_wait_at_least_cycles (최소값) | hal_delay_cycles (정확값) |
 | JTAG | TCKpulse (CKpulseN/L) | busy_wait_at_least_cycles | hal_delay_cycles |
 | PIC24 SIX/REGOUT | 롱클럭 16사이클 | busy_wait_at_least_cycles | hal_delay_cycles |
@@ -121,7 +121,7 @@ PIO 드라이버(`src/pio_drivers.c`)에서 include됩니다.
 | 프로토콜 | 파일 | 명령 수 | PIO 클럭 | 설명 |
 |----------|------|---------|----------|------|
 | One-Wire | `src/ow.pio` | 32 | 1 MHz | reset/presence/write-0/write-1/read 슬롯. 오픈드레인은 `set pindirs`로 방향 토글 |
-| UNI/O | `src/unio.pio` | 6 | 100 kHz | Manchester 하프비트 16개 시프트. 호스트가 바이트→16비트 방향 패턴 인코딩 |
+| UNI/O | `src/unio.pio` | 6 | 200 kHz | Manchester 하프비트 16개 시프트(루프 2사이클/하프비트 → 5 us/cycle → 10 us 하프비트 = 50 kbit/s). 호스트가 바이트→16비트 방향 패턴 인코딩 |
 | JTAG | `src/jtag.pio` | 8+4 | 1 MHz | 32비트 시프트 엔진 + TMS 펄스 엔진 (2개 프로그램) |
 | Microwire | `src/uw.pio` | 8 | 1 MHz | 32비트 동시 송수신 시프트 엔진 |
 
@@ -173,7 +173,7 @@ SM을 끄고 PIN_SDA를 SIO open-drain으로 복원합니다. OW와 UNI/O는
 
 JTAG/uW PIO 엔진(jtag.pio, uw.pio)은 더 이상 빌드하지 않습니다.
 SIO 비트뱅이 정밀도와 유연성에서 충분하며, PIO 마이그레이션은
-타이밍 보장이 필수인 OW(1-Wire reset/slot)와 UNI/O(50 kHz Manchester
+타이밍 보장이 필수인 OW(1-Wire reset/slot)와 UNI/O(50 kbit/s Manchester
 하프비트)에만 적용됩니다.
 
 ### 4.5 PIO 타이밍 정확도
@@ -182,8 +182,7 @@ PIO는 독립 클럭 분주기로 동작해 CPU 인터럽트/캐시 미스와 �
 
 - **One-Wire**: 1MHz PIO 클럭 → 1us 단위 정밀. reset 480us(중첩 루프),
   presence 샘플 62us, write-0 60us, write-1 6us+64us, read 6us+15us 샘플
-- **UNI/O**: 100kHz PIO 클럭 → 10us(T) 단위 정밀. Manchester 하프비트
-  16개를 CPU 개입 없이 시프트
+- **UNI/O**: 200kHz PIO 클럭 → 5us 단위(루프 2사이클/하프비트 → 10us 하프비트 = 50 kbit/s). Manchester 하프비트 16개를 CPU 개입 없이 시프트
 - **JTAG/uW**: 1MHz 기본 (clkdiv로 조정 가능), 최대 30MHz+까지 상향 가능
 
 ## 5. 검증 방법

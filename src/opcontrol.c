@@ -63,7 +63,13 @@
 #define RX_ERR      0xfe
 #define INS_ERR     0xfe
 #define ACK_ERR     0xfd
-#define Vcost       72.282         // (12/(12+22)/5*1024) Voltage feedback constant
+#define Vcost       72.1635        // (10/(33+10)/3.3*1024) Voltage feedback constant (RP2040)
+                                   // Divider: 33k top / 10k bottom. At 3.3V VREF the
+                                   // ratio is chosen to match the original PIC value
+                                   // (72.282 @ 12k/22k, 5V VREF) within 0.16%, so the
+                                   // PID coefficients (225/228) and SET_VPP's d*72/10
+                                   // need no change. 13V -> 3.023V at the ADC pin
+                                   // (ADC saturates at ~14.19V).
 
 //***************PORTB-derived pin aliases (kept for grep parity) **********
 #define Dnum        PIN_D

@@ -35,9 +35,9 @@
  * contiguous GPIO numbers for an easy PCB layout). Adjust PIN_* constants
  * below to match your board.
  *
- *   PIN_D      GP5   (was RB5)
- *   PIN_CK     GP6   (was RB6)
- *   PIN_PGM    GP7   (was RB7)
+ *   PIN_D      GP5   (was RB5)  -- JTAG TDO / ICSP PGD (shared), slew FAST
+ *   PIN_CK     GP6   (was RB6)  -- JTAG TCK / ICSP PGC (shared), slew FAST
+ *   PIN_PGM    GP7   (was RB7)  -- JTAG TDI / AVR HVSP (shared), slew FAST
  *   PIN_SDA    GP10  (was RB0)
  *   PIN_SCL    GP11  (was RB1)
  *   PIN_A0     GP14  (was RB3)
@@ -89,9 +89,32 @@ extern "C" {
 #define PIN_PWM      22
 #define PIN_WP       26
 #define PIN_SDO      27
-#define PIN_VREG_FB  28   // ADC input 2 (Vreg * 12k / 34k feedback)
+#define PIN_VREG_FB  28   // ADC input 2 (Vreg * 10k / 43k feedback: 33k top, 10k bottom)
 
 #define ADC_VREG_CHANNEL 2  // ADC2 = GP28
+
+// ---- Slew rate: all signal pins forced FAST ------------------------------
+// RP2040 pads power up in SLOW mode (PADS_BANK0 SLEWFAST reset = 0), so
+// hal_init() explicitly sets every digital signal pin to FAST. Rationale:
+//
+//   * Every protocol this programmer drives runs at <= ~10 MHz, where a
+//     FAST edge (~1-3 ns) is under 2% of the clock period -- safe with
+//     ample setup/hold margin. SLOW edges (~10-30 ns) would eat 3-30% of
+//     a 100 ns (10 MHz) TCK / SPI clock and erode timing margin.
+//   * The same pins are shared across protocols: PIN_D/CK/PGM carry JTAG
+//     TDO/TCK/TDI *and* PIC ICSP, PIC24 SIX/REGOUT/TX16/RX16, and AVR
+//     HVSP. PIC24 CKpulseL is only ~750 ns, so SLOW would consume ~3% of
+//     the pulse even at the slower protocols. FAST matches the original
+//     PIC18F2550 behaviour (no slew control -> always fast).
+//   * SLOW's only benefit (EMI / ringing reduction on long cables) is
+//     better served by external 33-100 ohm series resistors, which also
+//     provide short-circuit / ESD / over-current protection that slew
+//     control cannot. See README 7.6 for the per-pin resistor table.
+//
+// If you ever need SLOW on a specific pin (e.g. a 5 MHz+ JTAG target on a
+// very long, unterminated cable), call gpio_set_slew_rate(pin, SLOW) from
+// your own code; the per-pin setting overrides this init.
+
 
 // ---- AT_HV_RTX pin aliases (AVR high-voltage serial programming) ---------
 // The original firmware maps AVR HVSP signals onto PORTB/PORTC pins:

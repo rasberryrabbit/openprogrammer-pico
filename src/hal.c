@@ -284,7 +284,12 @@ void hal_init(void) {
     hlvdif_flag = false;
 
     // Initialise all signal GPIOs as inputs (safe default); the firmware's
-    // UserInit() will reconfigure them as needed.
+    // UserInit() will reconfigure them as needed. RP2040 pads power up in
+    // SLOW mode; explicitly set every digital signal pin to FAST (see the
+    // rationale block in hal.h). Series resistors (33-100 ohm on signal
+    // lines, 1k+ on HV/ADC) handle ringing/EMI and protection, so SLOW is
+    // not needed and would only erode timing margin on the faster clocks
+    // (PIC24 CKpulseL ~750 ns, JTAG/SPI up to 10 MHz).
     const uint8_t inputs[] = { PIN_D, PIN_CK, PIN_PGM, PIN_SDA, PIN_SCL,
                                PIN_A0, PIN_A1, PIN_SW1, PIN_VPP, PIN_VCC,
                                PIN_WP, PIN_SDO };
@@ -292,12 +297,18 @@ void hal_init(void) {
         gpio_init(inputs[i]);
         gpio_set_dir(inputs[i], GPIO_IN);
         gpio_pull_up(inputs[i]);
+        gpio_set_slew_rate(inputs[i], GPIO_SLEW_RATE_FAST);
     }
     // LEDs are outputs, off.
     gpio_init(PIN_LED1); gpio_set_dir(PIN_LED1, GPIO_OUT); gpio_put(PIN_LED1, 0);
     gpio_init(PIN_LED2); gpio_set_dir(PIN_LED2, GPIO_OUT); gpio_put(PIN_LED2, 0);
     // PWM pin starts as low output (DCDC off).
     gpio_init(PIN_PWM);  gpio_set_dir(PIN_PWM, GPIO_OUT);  gpio_put(PIN_PWM, 0);
+    // Fast edges on the outputs too (uniform edge profile; the DCDC gate
+    // driver, not the RP2040 pad, sets the actual MOSFET edge rate).
+    gpio_set_slew_rate(PIN_LED1, GPIO_SLEW_RATE_FAST);
+    gpio_set_slew_rate(PIN_LED2, GPIO_SLEW_RATE_FAST);
+    gpio_set_slew_rate(PIN_PWM,  GPIO_SLEW_RATE_FAST);
     // Mode-select button is active-low with internal pull-up.
     gpio_init(PIN_SW1);  gpio_set_dir(PIN_SW1, GPIO_IN);   gpio_pull_up(PIN_SW1);
     // Vreg feedback ADC.

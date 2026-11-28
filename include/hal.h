@@ -35,9 +35,9 @@
  * contiguous GPIO numbers for an easy PCB layout). Adjust PIN_* constants
  * below to match your board.
  *
- *   PIN_D      GP5   (was RB5)  -- JTAG TDO / ICSP PGD (shared), slew FAST
- *   PIN_CK     GP6   (was RB6)  -- JTAG TCK / ICSP PGC (shared), slew FAST
- *   PIN_PGM    GP7   (was RB7)  -- JTAG TDI / AVR HVSP (shared), slew FAST
+ *   PIN_D      GP5   (was RB5)  -- JTAG TDO / ICSP PGD (shared)
+ *   PIN_CK     GP6   (was RB6)  -- JTAG TCK / ICSP PGC (shared)
+ *   PIN_PGM    GP7   (was RB7)  -- JTAG TDI / AVR HVSP (shared)
  *   PIN_SDA    GP10  (was RB0)
  *   PIN_SCL    GP11  (was RB1)
  *   PIN_A0     GP14  (was RB3)
@@ -93,27 +93,29 @@ extern "C" {
 
 #define ADC_VREG_CHANNEL 2  // ADC2 = GP28
 
-// ---- Slew rate: all signal pins forced FAST ------------------------------
-// RP2040 pads power up in SLOW mode (PADS_BANK0 SLEWFAST reset = 0), so
-// hal_init() explicitly sets every digital signal pin to FAST. Rationale:
+// ---- Slew-rate strap -----------------------------------------------------
+// RP2040 pads power up in SLOW mode (PADS_BANK0 SLEWFAST reset = 0), which
+// is the safe default: gentle edges play well with auto-sensing level
+// shifters (TXB0108/TXS0108 forbid large series resistors because their
+// one-shot edge detector is RC-loaded) and keep EMI low on long cables.
 //
-//   * Every protocol this programmer drives runs at <= ~10 MHz, where a
-//     FAST edge (~1-3 ns) is under 2% of the clock period -- safe with
-//     ample setup/hold margin. SLOW edges (~10-30 ns) would eat 3-30% of
-//     a 100 ns (10 MHz) TCK / SPI clock and erode timing margin.
-//   * The same pins are shared across protocols: PIN_D/CK/PGM carry JTAG
-//     TDO/TCK/TDI *and* PIC ICSP, PIC24 SIX/REGOUT/TX16/RX16, and AVR
-//     HVSP. PIC24 CKpulseL is only ~750 ns, so SLOW would consume ~3% of
-//     the pulse even at the slower protocols. FAST matches the original
-//     PIC18F2550 behaviour (no slew control -> always fast).
-//   * SLOW's only benefit (EMI / ringing reduction on long cables) is
-//     better served by external 33-100 ohm series resistors, which also
-//     provide short-circuit / ESD / over-current protection that slew
-//     control cannot. See README 7.6 for the per-pin resistor table.
+// A hardware strap on GP2 lets the user opt INTO fast edges at boot. The
+// pin is sampled once in hal_init() with the internal pull-DOWN enabled,
+// so the default (strap left open / pulled LOW) keeps SLOW. Tying the
+// strap to 3V3 with a jumper selects FAST for short, well-terminated
+// lines where every protocol this programmer drives (<= ~10 MHz) gets a
+// 2% edge margin and PIC24 CKpulseL (~750 ns) is not eroded.
 //
-// If you ever need SLOW on a specific pin (e.g. a 5 MHz+ JTAG target on a
-// very long, unterminated cable), call gpio_set_slew_rate(pin, SLOW) from
-// your own code; the per-pin setting overrides this init.
+// The strap only addresses signal integrity (ringing/EMI); it does NOT
+// replace series resistors for short-circuit / ESD / over-current
+// protection -- see README 7.6 for the per-pin resistor table. To
+// override a single pin later, call gpio_set_slew_rate(pin, mode); the
+// per-pin setting takes precedence over this init.
+#define PIN_SLEW_STRAP  2   // GP2: 0=SLOW (default, open/pulled low), 1=FAST (jumper to 3V3)
+
+// Resolved once at boot by hal_init() from PIN_SLEW_STRAP. Applied to all
+// digital signal pins via gpio_set_slew_rate().
+extern enum gpio_slew_rate g_gpio_slew;
 
 
 // ---- AT_HV_RTX pin aliases (AVR high-voltage serial programming) ---------

@@ -22,6 +22,10 @@ hal_hlvdccon_t HLVDCONbits;
 volatile uint8_t HLVDCON = 0;
 volatile bool hlvdif_flag = false;
 
+// GPIO slew rate resolved once at boot from PIN_SLEW_STRAP.
+// Default SLOW (strap open / pulled low); FAST when strap jumpered to 3V3.
+enum gpio_slew_rate g_gpio_slew = GPIO_SLEW_RATE_SLOW;
+
 // LED cache (so LED1/LED2 read-back matches last write; original LEDs are
 // write-only but the original code occasionally does `LED2 = !LED2`).
 static int led1_state = 0, led2_state = 0;
@@ -283,13 +287,29 @@ void hal_init(void) {
     HLVDCON = 0;
     hlvdif_flag = false;
 
+    // ---- Slew-rate strap: sample ONCE at boot ----------------------------
+    // Internal pull-down -> default LOW (SLOW). Jumper to 3V3 -> HIGH (FAST).
+    // Sample before any other pin is reconfigured, so the strap is read at
+    // its idle level. The strap pin itself is then left as a pulled-down
+    // input and takes no further part in the firmware. Default SLOW is the
+    // safe choice: it plays well with auto-sensing level shifters
+    // (TXB0108/TXS0108) whose one-shot edge detector is RC-loaded, and keeps
+    // EMI low on long cables. Strap to 3V3 to opt into FAST for short,
+    // well-terminated lines (see rationale block in hal.h).
+    gpio_init(PIN_SLEW_STRAP);
+    gpio_set_dir(PIN_SLEW_STRAP, GPIO_IN);
+    gpio_pull_down(PIN_SLEW_STRAP);
+    // Let the pull-down settle (the pad's RC + external stray C). A few us
+    // is ample; we wait a little more for margin.
+    busy_wait_us(20);
+    g_gpio_slew = gpio_get(PIN_SLEW_STRAP) ? GPIO_SLEW_RATE_FAST
+                                           : GPIO_SLEW_RATE_SLOW;
+
     // Initialise all signal GPIOs as inputs (safe default); the firmware's
-    // UserInit() will reconfigure them as needed. RP2040 pads power up in
-    // SLOW mode; explicitly set every digital signal pin to FAST (see the
-    // rationale block in hal.h). Series resistors (33-100 ohm on signal
-    // lines, 1k+ on HV/ADC) handle ringing/EMI and protection, so SLOW is
-    // not needed and would only erode timing margin on the faster clocks
-    // (PIC24 CKpulseL ~750 ns, JTAG/SPI up to 10 MHz).
+    // UserInit() will reconfigure them as needed. Apply the strap-selected
+    // slew rate to every digital signal pin. Series resistors (33-100 ohm on
+    // signal lines, 1k+ on HV/ADC) handle ringing/EMI and protection; the
+    // strap only adjusts edge rate.
     const uint8_t inputs[] = { PIN_D, PIN_CK, PIN_PGM, PIN_SDA, PIN_SCL,
                                PIN_A0, PIN_A1, PIN_SW1, PIN_VPP, PIN_VCC,
                                PIN_WP, PIN_SDO };
@@ -297,18 +317,19 @@ void hal_init(void) {
         gpio_init(inputs[i]);
         gpio_set_dir(inputs[i], GPIO_IN);
         gpio_pull_up(inputs[i]);
-        gpio_set_slew_rate(inputs[i], GPIO_SLEW_RATE_FAST);
+        gpio_set_slew_rate(inputs[i], g_gpio_slew);
     }
     // LEDs are outputs, off.
     gpio_init(PIN_LED1); gpio_set_dir(PIN_LED1, GPIO_OUT); gpio_put(PIN_LED1, 0);
     gpio_init(PIN_LED2); gpio_set_dir(PIN_LED2, GPIO_OUT); gpio_put(PIN_LED2, 0);
     // PWM pin starts as low output (DCDC off).
     gpio_init(PIN_PWM);  gpio_set_dir(PIN_PWM, GPIO_OUT);  gpio_put(PIN_PWM, 0);
-    // Fast edges on the outputs too (uniform edge profile; the DCDC gate
-    // driver, not the RP2040 pad, sets the actual MOSFET edge rate).
-    gpio_set_slew_rate(PIN_LED1, GPIO_SLEW_RATE_FAST);
-    gpio_set_slew_rate(PIN_LED2, GPIO_SLEW_RATE_FAST);
-    gpio_set_slew_rate(PIN_PWM,  GPIO_SLEW_RATE_FAST);
+    // Apply the strap-selected slew rate to the outputs too (uniform edge
+    // profile; the DCDC gate driver, not the RP2040 pad, sets the actual
+    // MOSFET edge rate).
+    gpio_set_slew_rate(PIN_LED1, g_gpio_slew);
+    gpio_set_slew_rate(PIN_LED2, g_gpio_slew);
+    gpio_set_slew_rate(PIN_PWM,  g_gpio_slew);
     // Mode-select button is active-low with internal pull-up.
     gpio_init(PIN_SW1);  gpio_set_dir(PIN_SW1, GPIO_IN);   gpio_pull_up(PIN_SW1);
     // Vreg feedback ADC.
